@@ -1,0 +1,1505 @@
+"""NFT Market Bot - Discord buyer/seller matching and Solana cryptographic wallet verification.
+
+This bot manages:
+- NFT buy/sell registration (/sell, /buy)
+- Matching compatible collections & budgets (/matches)
+- Private temporary deal channels (deal-XXXXXXXX) under "🔐 PRIVATE MARKET"
+- Real Solana cryptographic wallet verification via signature (/wallet, /wallet-status, /wallet-remove)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import json
+import logging
+import os
+import secrets
+import sys
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Optional
+from urllib.parse import quote
+
+import discord
+from aiohttp import web
+from discord import app_commands
+from discord.ext import commands
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
+
+
+PRIVATE_MARKET_CATEGORY = "🔐 PRIVATE MARKET"
+DEAL_CHANNEL_TTL_HOURS = 24
+WALLET_NONCE_TTL_SECONDS = 5 * 60
+WALLET_MAX_SIGNATURE_ATTEMPTS = 3
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+class PrivateDealSetupError(RuntimeError):
+    """Raised when Discord cannot create a private deal channel safely."""
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
+log_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setFormatter(log_formatter)
+file_handler = logging.FileHandler("bot.log", mode="a", encoding="utf-8")
+file_handler.setFormatter(log_formatter)
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[stdout_handler, file_handler],
+)
+logger = logging.getLogger("nft-market-bot")
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def clean_text(value: str) -> str:
+    """Collapse whitespace and keep user-entered values easy to read."""
+    return " ".join(value.strip().split())
+
+
+def parse_amount(value: str) -> Optional[Decimal]:
+    """Parse a positive amount without accepting malformed numeric input."""
+    try:
+        amount = Decimal(clean_text(value).replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return None
+    return amount if amount > 0 else None
+
+
+def format_amount(amount: Decimal, currency: str) -> str:
+    formatted = f"{amount:,.4f}".rstrip("0").rstrip(".")
+    return f"{formatted} {currency}"
+
+
+def compatible_collection(left: str, right: str) -> bool:
+    """Allow exact names and simple name variations such as 'Cool Cats NFT'."""
+    first = clean_text(left).casefold()
+    second = clean_text(right).casefold()
+    return first == second or first in second or second in first
+
+
+@dataclass
+class Listing:
+    listing_id: str
+    kind: str
+    guild_id: int
+    user_id: int
+    user_name: str
+    collection: str
+    currency: str
+    amount: Decimal
+    details: str
+    mint_address: str = ""
+    active: bool = True
+    created_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass
+class Match:
+    match_id: str
+    guild_id: int
+    seller: Listing
+    buyer: Listing
+    channel_id: Optional[int] = None
+    channel_name: Optional[str] = None
+    created_at: datetime = field(default_factory=utc_now)
+    closed_at: Optional[datetime] = None
+
+
+@dataclass
+class WalletSession:
+    token: str
+    discord_user_id: int
+    nonce: str
+    created_at: datetime = field(default_factory=utc_now)
+    attempts: int = 0
+    used: bool = False
+
+    @property
+    def expires_at(self) -> datetime:
+        return datetime.fromtimestamp(
+            self.created_at.timestamp() + WALLET_NONCE_TTL_SECONDS,
+            tz=timezone.utc,
+        )
+
+
+@dataclass
+class WalletAssociation:
+    discord_user_id: int
+    public_key: str
+    verified_at: datetime = field(default_factory=utc_now)
+
+
+class WalletStore:
+    """Short-lived nonce sessions and one-to-one verified wallet associations."""
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, WalletSession] = {}
+        self.by_user: dict[int, WalletAssociation] = {}
+        self.user_by_wallet: dict[str, int] = {}
+
+    def create_session(self, discord_user_id: int) -> WalletSession:
+        now = utc_now()
+        self.sessions = {
+            token: session
+            for token, session in self.sessions.items()
+            if not session.used and session.expires_at > now
+        }
+        session = WalletSession(
+            token=secrets.token_urlsafe(32),
+            discord_user_id=discord_user_id,
+            nonce=secrets.token_urlsafe(24),
+            created_at=now,
+        )
+        self.sessions[session.token] = session
+        logger.info(
+            "Wallet verification requested for Discord user=%s, session=%s.",
+            discord_user_id,
+            session.token[:8],
+        )
+        return session
+
+    def get_session(self, token: str) -> Optional[WalletSession]:
+        return self.sessions.get(token)
+
+    @staticmethod
+    def verification_message(session: WalletSession) -> str:
+        return (
+            "NFT Market Wallet Verification\n"
+            f"Discord User ID: {session.discord_user_id}\n"
+            f"Nonce: {session.nonce}"
+        )
+
+    def get_message(self, token: str) -> Optional[tuple[str, datetime]]:
+        session = self.get_session(token)
+        if (
+            session is None
+            or session.used
+            or session.expires_at <= utc_now()
+            or session.attempts >= WALLET_MAX_SIGNATURE_ATTEMPTS
+        ):
+            return None
+        return self.verification_message(session), session.expires_at
+
+    def verify(
+        self, token: str, public_key: str, encoded_signature: str
+    ) -> tuple[bool, str, Optional[WalletAssociation]]:
+        session = self.get_session(token)
+        if session is None or session.used:
+            return False, "This verification link is invalid or already used.", None
+        if session.expires_at <= utc_now():
+            session.used = True
+            return False, "This verification link has expired. Run /wallet again.", None
+        if session.attempts >= WALLET_MAX_SIGNATURE_ATTEMPTS:
+            session.used = True
+            return False, "Too many signature attempts. Run /wallet again.", None
+
+        session.attempts += 1
+        try:
+            public_key_bytes = decode_base58(public_key)
+            try:
+                signature_bytes = base64.b64decode(encoded_signature, validate=True)
+                if len(signature_bytes) != 64:
+                    signature_bytes = decode_base58(encoded_signature)
+            except (binascii.Error, ValueError):
+                signature_bytes = decode_base58(encoded_signature)
+
+            if len(public_key_bytes) != 32 or len(signature_bytes) != 64:
+                raise ValueError("Unexpected Solana key or signature length.")
+            VerifyKey(public_key_bytes).verify(
+                self.verification_message(session).encode("utf-8"),
+                signature_bytes,
+            )
+        except (BadSignatureError, ValueError, binascii.Error, TypeError):
+            if session.attempts >= WALLET_MAX_SIGNATURE_ATTEMPTS:
+                session.used = True
+            return False, "The wallet signature is invalid.", None
+
+        existing_user_id = self.user_by_wallet.get(public_key)
+        if existing_user_id is not None and existing_user_id != session.discord_user_id:
+            session.used = True
+            return (
+                False,
+                "This wallet is already associated with another Discord account.",
+                None,
+            )
+
+        existing_association = self.by_user.get(session.discord_user_id)
+        if (
+            existing_association is not None
+            and existing_association.public_key != public_key
+        ):
+            session.used = True
+            return (
+                False,
+                "A different wallet is already associated. Use /wallet-remove first.",
+                None,
+            )
+
+        association = WalletAssociation(
+            discord_user_id=session.discord_user_id,
+            public_key=public_key,
+        )
+        self.by_user[session.discord_user_id] = association
+        self.user_by_wallet[public_key] = session.discord_user_id
+        session.used = True
+        return True, "Wallet verified successfully.", association
+
+    def get_association(self, discord_user_id: int) -> Optional[WalletAssociation]:
+        return self.by_user.get(discord_user_id)
+
+    def remove_association(self, discord_user_id: int) -> Optional[WalletAssociation]:
+        association = self.by_user.pop(discord_user_id, None)
+        if association is not None:
+            self.user_by_wallet.pop(association.public_key, None)
+            logger.info(
+                "Wallet removed for Discord user=%s, wallet=%s.",
+                discord_user_id,
+                short_public_key(association.public_key),
+            )
+        return association
+
+
+def decode_base58(value: str) -> bytes:
+    """Decode a Solana public key without contacting a blockchain or RPC."""
+    if not value or any(character not in BASE58_ALPHABET for character in value):
+        raise ValueError("Invalid base58 value.")
+    number = 0
+    for character in value:
+        number = number * 58 + BASE58_ALPHABET.index(character)
+    decoded = (
+        number.to_bytes((number.bit_length() + 7) // 8, "big")
+        if number
+        else b""
+    )
+    leading_zeroes = len(value) - len(value.lstrip("1"))
+    return b"\x00" * leading_zeroes + decoded
+
+
+def encode_base58(raw: bytes) -> str:
+    """Encode bytes into base58 string without external RPC dependencies."""
+    if not raw:
+        return ""
+    number = int.from_bytes(raw, "big")
+    chars = []
+    while number > 0:
+        number, remainder = divmod(number, 58)
+        chars.append(BASE58_ALPHABET[remainder])
+    leading_zeroes = len(raw) - len(raw.lstrip(b"\x00"))
+    return "1" * leading_zeroes + "".join(reversed(chars))
+
+
+def short_public_key(public_key: str) -> str:
+    return f"{public_key[:4]}...{public_key[-4:]}"
+
+
+# Persistent wallet storage: use Supabase when configured, otherwise keep the
+# in-memory fallback for local development.
+_SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+_SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+if _SUPABASE_URL and _SUPABASE_SERVICE_KEY:
+    from supabase_store import SupabaseClient, SupabaseWalletStore
+    WALLET_STORE = SupabaseWalletStore(
+        SupabaseClient(_SUPABASE_URL, _SUPABASE_SERVICE_KEY)
+    )
+    logger.info("⚡ Supabase wallet storage enabled.")
+else:
+    WALLET_STORE = WalletStore()
+    logger.info("ℹ️ Supabase wallet storage disabled; using in-memory wallet storage.")
+
+
+WALLET_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFT Market Wallet Verification</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0b1020; color: #f8fafc; }
+    main { width: min(92vw, 520px); box-sizing: border-box; padding: 32px;
+      border: 1px solid #27345c; border-radius: 18px; background: #121a32;
+      box-shadow: 0 20px 60px #0008; }
+    h1 { margin-top: 0; font-size: 1.5rem; }
+    p { line-height: 1.55; color: #cbd5e1; }
+    pre { white-space: pre-wrap; padding: 16px; border-radius: 10px;
+      background: #0b1020; color: #dbeafe; font-size: .9rem; }
+    button { width: 100%; border: 0; border-radius: 10px; padding: 13px 16px;
+      color: #fff; background: #635bff; font-weight: 700; cursor: pointer; }
+    button:disabled { cursor: wait; opacity: .65; }
+    #status { min-height: 24px; margin-top: 16px; font-weight: 600; }
+    .warning { color: #fbbf24; font-size: .9rem; }
+    .success { color: #86efac; }
+    .error { color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>🔐 Verify Solana Wallet</h1>
+    <p>This page verifies that you control a Solana public address by asking your wallet to sign a one-time message.</p>
+    <p class="warning">Never enter a seed phrase, private key, or Phantom password here. NFT Market never asks for them.</p>
+    <h2>Message to sign</h2>
+    <pre id="message">Loading secure message…</pre>
+    <button id="verify" type="button" disabled>Connect and sign with Phantom</button>
+    <div id="status" role="status" aria-live="polite"></div>
+  </main>
+  <script>
+    const session = new URLSearchParams(window.location.search).get("session");
+    const messageElement = document.getElementById("message");
+    const statusElement = document.getElementById("status");
+    const verifyButton = document.getElementById("verify");
+    let verificationMessage = "";
+
+    function setStatus(text, kind = "") {
+      statusElement.textContent = text;
+      statusElement.className = kind;
+    }
+
+    function getSolanaProvider() {
+      return window.phantom?.solana || window.solana || null;
+    }
+
+    function bytesToBase64(bytes) {
+      if (typeof bytes === "string") return bytes;
+      const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      let binary = "";
+      for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);
+      return window.btoa(binary);
+    }
+
+    async function loadMessage() {
+      if (!session) {
+        setStatus("This verification link is invalid.", "error");
+        return;
+      }
+      const response = await fetch("/api/wallet/message?session=" + encodeURIComponent(session));
+      const data = await response.json();
+      if (!response.ok) {
+        setStatus(data.error || "This verification link is no longer valid.", "error");
+        return;
+      }
+      verificationMessage = data.message;
+      messageElement.textContent = verificationMessage;
+      verifyButton.disabled = false;
+      setStatus("The secure message is ready to sign.");
+    }
+
+    async function verifyWallet() {
+      const provider = getSolanaProvider();
+      if (!provider) {
+        setStatus("Install Phantom or another Solana wallet extension, then reload this page.", "error");
+        return;
+      }
+      verifyButton.disabled = true;
+      try {
+        setStatus("Connecting to your wallet…");
+        const connection = await provider.connect();
+        const publicKey = connection.publicKey?.toString() || provider.publicKey?.toString();
+        if (!publicKey) throw new Error("The wallet did not return a public address.");
+        setStatus("Wallet connected. Waiting for your signature…");
+        const signed = await provider.signMessage(new TextEncoder().encode(verificationMessage), "utf8");
+        const signature = signed.signature || signed;
+        const response = await fetch("/api/wallet/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session,
+            publicKey,
+            signature: bytesToBase64(signature)
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Wallet verification failed.");
+        setStatus("✅ Wallet verified successfully. You can return to Discord.", "success");
+        messageElement.textContent = "Verified public address: " + data.publicKey;
+      } catch (error) {
+        setStatus(error.message || "Wallet verification was cancelled.", "error");
+        verifyButton.disabled = false;
+      }
+    }
+
+    verifyButton.addEventListener("click", verifyWallet);
+    loadMessage().catch(() => setStatus("Could not load the secure verification message.", "error"));
+  </script>
+</body>
+</html>"""
+
+
+def render_wallet_page(session_token: str) -> str:
+    return WALLET_PAGE_TEMPLATE
+
+
+async def wallet_verify_page(request: web.Request) -> web.Response:
+    session_token = request.query.get("session", "")
+    return web.Response(
+        text=render_wallet_page(session_token),
+        content_type="text/html",
+        charset="utf-8",
+        headers={
+            "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
+async def wallet_message(request: web.Request) -> web.Response:
+    session_token = request.query.get("session", "")
+    result = await WALLET_STORE.get_message(session_token)
+    if result is None:
+        return web.json_response(
+            {"ok": False, "error": "This verification link is invalid or expired."},
+            status=410,
+        )
+    message, expires_at = result
+    return web.json_response(
+        {
+            "ok": True,
+            "message": message,
+            "expiresAt": expires_at.isoformat(),
+        }
+    )
+
+
+async def wallet_verify(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response(
+            {"ok": False, "error": "Invalid verification request."},
+            status=400,
+        )
+
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"ok": False, "error": "Invalid verification request."},
+            status=400,
+        )
+
+    session_token = body.get("session")
+    public_key = body.get("publicKey")
+    signature = body.get("signature")
+    if not all(
+        isinstance(value, str) for value in (session_token, public_key, signature)
+    ):
+        return web.json_response(
+            {"ok": False, "error": "Wallet address and signature are required."},
+            status=400,
+        )
+
+    session = await WALLET_STORE.get_session(session_token)
+    if session is not None:
+        logger.info(
+            "Wallet connected for Discord user=%s, wallet=%s.",
+            session.discord_user_id,
+            short_public_key(public_key),
+        )
+
+    verified, message, association = await WALLET_STORE.verify(
+        session_token,
+        public_key,
+        signature,
+    )
+    if not verified or association is None:
+        user_id = session.discord_user_id if session is not None else "unknown"
+        logger.warning(
+            "Wallet signature refused for Discord user=%s, wallet=%s: %s",
+            user_id,
+            short_public_key(public_key),
+            message,
+        )
+        return web.json_response({"ok": False, "error": message}, status=400)
+
+    logger.info(
+        "Wallet signature validated for Discord user=%s, wallet=%s.",
+        association.discord_user_id,
+        short_public_key(association.public_key),
+    )
+    logger.info(
+        "Wallet associated with Discord user=%s, wallet=%s.",
+        association.discord_user_id,
+        short_public_key(association.public_key),
+    )
+    try:
+        await bot.notify_wallet_verified(association)
+    except Exception as exc:
+        logger.warning(
+            "Could not dispatch Discord DM notification for user=%s: %s",
+            association.discord_user_id,
+            exc,
+        )
+    return web.json_response(
+        {
+            "ok": True,
+            "message": "Wallet verified successfully.",
+            "publicKey": association.public_key,
+            "verifiedAt": association.verified_at.isoformat(),
+        }
+    )
+
+
+class WalletVerifyView(discord.ui.View):
+    def __init__(self, url: str) -> None:
+        super().__init__(timeout=10 * 60)
+        self.add_item(
+            discord.ui.Button(
+                label="🔐 Verify Solana Wallet",
+                style=discord.ButtonStyle.link,
+                url=url,
+            )
+        )
+
+
+class InMemoryStore:
+    """Temporary storage with a small interface that can later use SQLite/PostgreSQL."""
+
+    def __init__(self) -> None:
+        self.sell_requests: list[Listing] = []
+        self.buy_requests: list[Listing] = []
+        self.matches: list[Match] = []
+
+    @staticmethod
+    def _compatible(seller: Listing, buyer: Listing) -> bool:
+        return (
+            seller.active
+            and buyer.active
+            and seller.guild_id == buyer.guild_id
+            and seller.currency == buyer.currency
+            and buyer.amount >= seller.amount
+            and compatible_collection(buyer.collection, seller.collection)
+        )
+
+    def _create_match(self, seller: Listing, buyer: Listing) -> Match:
+        seller.active = False
+        buyer.active = False
+        match = Match(
+            match_id=uuid.uuid4().hex[:8],
+            guild_id=seller.guild_id,
+            seller=seller,
+            buyer=buyer,
+        )
+        self.matches.append(match)
+        return match
+
+    def add_sell_request(self, listing: Listing) -> Optional[Match]:
+        self.sell_requests.append(listing)
+        for buyer in self.buy_requests:
+            if self._compatible(listing, buyer):
+                return self._create_match(listing, buyer)
+        return None
+
+    def add_buy_request(self, listing: Listing) -> Optional[Match]:
+        self.buy_requests.append(listing)
+        for seller in self.sell_requests:
+            if self._compatible(seller, listing):
+                return self._create_match(seller, listing)
+        return None
+
+    def reconcile(self, guild_id: int) -> list[Match]:
+        """Match every compatible active request in one server."""
+        created_matches: list[Match] = []
+        while True:
+            pair: Optional[tuple[Listing, Listing]] = None
+            for seller in self.sell_requests:
+                if not seller.active or seller.guild_id != guild_id:
+                    continue
+                buyer = next(
+                    (
+                        candidate
+                        for candidate in self.buy_requests
+                        if candidate.guild_id == guild_id
+                        and self._compatible(seller, candidate)
+                    ),
+                    None,
+                )
+                if buyer is not None:
+                    pair = (seller, buyer)
+                    break
+            if pair is None:
+                return created_matches
+            created_matches.append(self._create_match(*pair))
+
+    def cancel_latest(self, user_id: int, request_type: str) -> list[Listing]:
+        collections = {
+            "buy": self.buy_requests,
+            "sell": self.sell_requests,
+            "both": self.buy_requests + self.sell_requests,
+        }
+        cancelled: list[Listing] = []
+        for listing in sorted(
+            collections[request_type],
+            key=lambda item: item.created_at,
+            reverse=True,
+        ):
+            if listing.user_id == user_id and listing.active:
+                listing.active = False
+                cancelled.append(listing)
+                if request_type != "both":
+                    break
+        return cancelled
+
+    def matches_for_user(self, user_id: int) -> list[Match]:
+        return [
+            match
+            for match in self.matches
+            if match.seller.user_id == user_id or match.buyer.user_id == user_id
+        ]
+
+
+STORE = InMemoryStore()
+
+
+class SellModal(discord.ui.Modal, title="Register an NFT to sell"):
+    collection = discord.ui.TextInput(
+        label="NFT collection or name",
+        placeholder="Example: Solana Monkey Business",
+        max_length=100,
+    )
+    mint_address = discord.ui.TextInput(
+        label="NFT mint address (optional)",
+        placeholder="Paste the NFT mint address if available",
+        required=False,
+        max_length=150,
+    )
+    price = discord.ui.TextInput(
+        label="Asking price in SOL",
+        placeholder="Example: 2.5 SOL",
+        max_length=30,
+    )
+    details = discord.ui.TextInput(
+        label="Traits or other details (optional)",
+        placeholder="Example: Gold fur, rare background",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        bot = interaction.client
+        if isinstance(bot, NFTMarketBot):
+            await bot.handle_sell(interaction, self)
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        await report_modal_error(interaction, error)
+
+
+class BuyModal(discord.ui.Modal, title="Register an NFT to buy"):
+    collection = discord.ui.TextInput(
+        label="NFT collection or name",
+        placeholder="Example: Solana Monkey Business",
+        max_length=100,
+    )
+    mint_address = discord.ui.TextInput(
+        label="NFT mint address (optional)",
+        placeholder="Paste the desired NFT mint address if available",
+        required=False,
+        max_length=150,
+    )
+    budget = discord.ui.TextInput(
+        label="Maximum budget in SOL",
+        placeholder="Example: 3 SOL",
+        max_length=30,
+    )
+    details = discord.ui.TextInput(
+        label="Traits or other details (optional)",
+        placeholder="Example: Prefer blue or gold traits",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        bot = interaction.client
+        if isinstance(bot, NFTMarketBot):
+            await bot.handle_buy(interaction, self)
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        await report_modal_error(interaction, error)
+
+
+async def report_modal_error(
+    interaction: discord.Interaction, error: Exception
+) -> None:
+    logger.exception("Unhandled modal submission error", exc_info=error)
+    message = "Something went wrong while saving that request. Please try again."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+class NFTMarketBot(commands.Bot):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        super().__init__(command_prefix=None, intents=intents, help_command=None)
+        self.ready_message_sent = False
+        self.wallet_web_runner: Optional[web.AppRunner] = None
+        self.wallet_web_port = self._get_wallet_web_port()
+
+    async def setup_hook(self) -> None:
+        await self.start_wallet_web_server()
+        synced = await self.tree.sync()
+        logger.info("Synced %d slash commands.", len(synced))
+
+    @staticmethod
+    def _get_wallet_web_port() -> int:
+        configured_port = os.getenv("WALLET_WEB_PORT")
+        # In this container environment, port 8000 is reserved by control-plane-a.
+        # Fall back to 5000 if WALLET_WEB_PORT is unset, invalid, or set to 8000.
+        if configured_port and configured_port.strip() != "8000":
+            try:
+                return int(configured_port.strip())
+            except ValueError:
+                logger.warning("Invalid wallet web port %r; using 5000.", configured_port)
+        return 5000
+
+    @staticmethod
+    def wallet_base_url() -> Optional[str]:
+        configured_url = (os.getenv("WALLET_VERIFY_BASE_URL") or os.getenv("APP_URL") or "").strip()
+        if configured_url:
+            cleaned = configured_url.rstrip("/")
+            return cleaned if cleaned.startswith("http://") or cleaned.startswith("https://") else f"https://{cleaned}"
+
+        domains = [
+            domain.strip()
+            for domain in os.getenv("REPLIT_DOMAINS", "").split(",")
+            if domain.strip()
+        ]
+        development_domain = os.getenv("REPLIT_DEV_DOMAIN", "").strip()
+        domain = domains[0] if domains else development_domain
+        if not domain:
+            return None
+        return domain if domain.startswith("http://") or domain.startswith("https://") else f"https://{domain}"
+
+    def wallet_url(self, session_token: str) -> Optional[str]:
+        base_url = self.wallet_base_url()
+        if base_url is None:
+            return None
+        return f"{base_url}/wallet/verify?session={quote(session_token, safe='')}"
+
+    async def start_wallet_web_server(self) -> None:
+        app = web.Application(client_max_size=64 * 1024)
+        app.router.add_get("/wallet/verify", wallet_verify_page)
+        app.router.add_get("/api/wallet/message", wallet_message)
+        app.router.add_post("/api/wallet/verify", wallet_verify)
+        self.wallet_web_runner = web.AppRunner(app)
+        await self.wallet_web_runner.setup()
+
+        # Try designated port, fallback to port 5000 or dynamic if already bound
+        ports_to_try = [self.wallet_web_port]
+        if 5000 not in ports_to_try:
+            ports_to_try.append(5000)
+
+        started = False
+        for port in ports_to_try:
+            try:
+                site = web.TCPSite(self.wallet_web_runner, "0.0.0.0", port)
+                await site.start()
+                self.wallet_web_port = port
+                started = True
+                logger.info(
+                    "Wallet verification page listening on 0.0.0.0:%s.",
+                    port,
+                )
+                break
+            except OSError as err:
+                logger.warning("Could not bind wallet server to port %s: %s", port, err)
+
+        if not started:
+            logger.error("Failed to bind wallet verification web server on ports %s", ports_to_try)
+
+    async def close(self) -> None:
+        if self.wallet_web_runner is not None:
+            await self.wallet_web_runner.cleanup()
+            self.wallet_web_runner = None
+        await super().close()
+
+    async def notify_wallet_verified(self, association: WalletAssociation) -> None:
+        if not self.is_ready():
+            return
+        user = await self.fetch_user_safely(association.discord_user_id)
+        if user is None:
+            return
+        try:
+            await user.send(
+                "✅ Wallet verified successfully.\n"
+                f"Public address: `{short_public_key(association.public_key)}`\n"
+                f"Verified at: {association.verified_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                "This confirms control of the Solana address only. It does not verify ownership of an NFT Pass."
+            )
+        except (discord.Forbidden, discord.HTTPException, Exception):
+            logger.warning(
+                "Wallet verified, but the confirmation DM could not be sent to Discord user=%s.",
+                association.discord_user_id,
+            )
+
+    async def handle_sell(
+        self, interaction: discord.Interaction, modal: SellModal
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        amount = parse_amount(str(modal.price.value))
+        collection = clean_text(str(modal.collection.value))
+        if not collection:
+            await interaction.followup.send(
+                "Please provide an NFT collection name or address.",
+                ephemeral=True,
+            )
+            return
+        if amount is None:
+            await interaction.followup.send(
+                "Please enter a positive asking price in SOL.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send(
+                "This command can only be used inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        listing = Listing(
+            listing_id=uuid.uuid4().hex[:8],
+            kind="sell",
+            guild_id=guild.id,
+            user_id=interaction.user.id,
+            user_name=interaction.user.display_name,
+            collection=collection,
+            mint_address=clean_text(str(modal.mint_address.value)),
+            amount=amount,
+            currency="SOL",
+            details=clean_text(str(modal.details.value)) or "None provided",
+        )
+        match = STORE.add_sell_request(listing)
+        if match is None:
+            await interaction.followup.send(
+                f"Your sell request for **{listing.collection}** is active. "
+                "I will notify you privately if a compatible buyer appears.",
+                ephemeral=True,
+            )
+            return
+
+        await self.complete_match(guild, match)
+        await interaction.followup.send(
+            self.match_summary(match, "seller"),
+            ephemeral=True,
+        )
+
+    async def handle_buy(
+        self, interaction: discord.Interaction, modal: BuyModal
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        amount = parse_amount(str(modal.budget.value))
+        collection = clean_text(str(modal.collection.value))
+        if not collection:
+            await interaction.followup.send(
+                "Please provide an NFT collection name or address.",
+                ephemeral=True,
+            )
+            return
+        if amount is None:
+            await interaction.followup.send(
+                "Please enter a positive maximum budget in SOL.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send(
+                "This command can only be used inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        listing = Listing(
+            listing_id=uuid.uuid4().hex[:8],
+            kind="buy",
+            guild_id=guild.id,
+            user_id=interaction.user.id,
+            user_name=interaction.user.display_name,
+            collection=collection,
+            mint_address=clean_text(str(modal.mint_address.value)),
+            amount=amount,
+            currency="SOL",
+            details=clean_text(str(modal.details.value)) or "None provided",
+        )
+        match = STORE.add_buy_request(listing)
+        if match is None:
+            await interaction.followup.send(
+                f"Your buy request for **{listing.collection}** is active. "
+                "I will notify you privately if a compatible seller appears.",
+                ephemeral=True,
+            )
+            return
+
+        await self.complete_match(guild, match)
+        await interaction.followup.send(
+            self.match_summary(match, "buyer"),
+            ephemeral=True,
+        )
+
+    @staticmethod
+    def match_summary(match: Match, role: str) -> str:
+        other_person = (
+            match.buyer.user_name if role == "seller" else match.seller.user_name
+        )
+        channel_text = (
+            f" Your private deal channel is {match.channel_name}."
+            if match.channel_name
+            else " I could not create the private channel, so please check the bot's permissions."
+        )
+        return (
+            f"Match found with **{other_person}** for **{match.seller.collection}**. "
+            f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**."
+            f"{channel_text}"
+        )
+
+    async def complete_match(self, guild: discord.Guild, match: Match) -> None:
+        channel: Optional[discord.TextChannel] = None
+        try:
+            channel = await self.create_private_deal_channel(guild, match)
+            match.channel_id = channel.id
+            match.channel_name = channel.mention
+            asyncio.create_task(self.delete_deal_channel_later(channel, match))
+        except PrivateDealSetupError as error:
+            logger.error(
+                "Private deal channel setup failed for guild=%s, match=%s: %s",
+                guild.id,
+                match.match_id,
+                error,
+            )
+        except discord.Forbidden as error:
+            logger.error(
+                "Discord refused private deal channel creation: guild=%s, match=%s, "
+                "status=%s, error_code=%s, message=%s. Check Manage Channels and "
+                "Manage Roles for the bot.",
+                guild.id,
+                match.match_id,
+                error.status,
+                getattr(error, "code", "unknown"),
+                getattr(error, "text", str(error)),
+                exc_info=True,
+            )
+        except discord.NotFound as error:
+            logger.error(
+                "Discord could not find the guild/category while creating a private "
+                "deal channel: guild=%s, match=%s, status=%s, message=%s",
+                guild.id,
+                match.match_id,
+                error.status,
+                getattr(error, "text", str(error)),
+                exc_info=True,
+            )
+        except discord.HTTPException as error:
+            logger.error(
+                "Discord rejected private deal channel creation: guild=%s, match=%s, "
+                "status=%s, error_code=%s, message=%s",
+                guild.id,
+                match.match_id,
+                error.status,
+                getattr(error, "code", "unknown"),
+                getattr(error, "text", str(error)),
+                exc_info=True,
+            )
+
+        embed = self.match_embed(match)
+        buyer = await self.fetch_user_safely(match.buyer.user_id)
+        seller = await self.fetch_user_safely(match.seller.user_id)
+        for user in (buyer, seller):
+            if user is None:
+                continue
+            try:
+                await user.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.info("Could not DM user %s about match %s.", user.id, match.match_id)
+
+        if channel is not None:
+            try:
+                await channel.send(
+                    content=f"<@{match.buyer.user_id}> <@{match.seller.user_id}>",
+                    embed=embed,
+                )
+            except discord.Forbidden as error:
+                logger.error(
+                    "Private deal channel exists but the bot cannot post in it: "
+                    "channel=%s, match=%s, status=%s, error_code=%s, message=%s",
+                    channel.id,
+                    match.match_id,
+                    error.status,
+                    getattr(error, "code", "unknown"),
+                    getattr(error, "text", str(error)),
+                    exc_info=True,
+                )
+            except discord.HTTPException as error:
+                logger.error(
+                    "Private deal channel exists but Discord rejected the first "
+                    "message: channel=%s, match=%s, status=%s, error_code=%s, message=%s",
+                    channel.id,
+                    match.match_id,
+                    error.status,
+                    getattr(error, "code", "unknown"),
+                    getattr(error, "text", str(error)),
+                    exc_info=True,
+                )
+
+    async def create_private_deal_channel(
+        self, guild: discord.Guild, match: Match
+    ) -> discord.TextChannel:
+        bot_member = guild.me
+        if bot_member is None:
+            raise PrivateDealSetupError(
+                "The bot member is not available in Discord's guild cache."
+            )
+
+        permissions = bot_member.guild_permissions
+        required_permissions = {
+            "View Channel": permissions.view_channel,
+            "Send Messages": permissions.send_messages,
+            "Embed Links": permissions.embed_links,
+            "Read Message History": permissions.read_message_history,
+            "Manage Channels": permissions.manage_channels,
+            "Manage Roles": permissions.manage_roles,
+        }
+        missing_permissions = [
+            name for name, granted in required_permissions.items() if not granted
+        ]
+        if missing_permissions:
+            raise PrivateDealSetupError(
+                "Missing bot permissions: "
+                + ", ".join(missing_permissions)
+                + ". Grant these permissions to the bot role."
+            )
+
+        category = next(
+            (
+                candidate
+                for candidate in guild.categories
+                if candidate.name.strip() == PRIVATE_MARKET_CATEGORY
+            ),
+            None,
+        )
+        if category is None:
+            logger.info(
+                "Creating private market category '%s' in guild=%s.",
+                PRIVATE_MARKET_CATEGORY,
+                guild.id,
+            )
+            category = await guild.create_category(
+                PRIVATE_MARKET_CATEGORY,
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False)
+                },
+                reason="NFT Market Bot private deal category",
+            )
+        else:
+            logger.info(
+                "Using existing private market category '%s' (id=%s) in guild=%s.",
+                category.name,
+                category.id,
+                guild.id,
+            )
+
+        buyer = await guild.fetch_member(match.buyer.user_id)
+        seller = await guild.fetch_member(match.seller.user_id)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            buyer: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+            ),
+            seller: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+            ),
+        }
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            embed_links=True,
+            manage_channels=True,
+        )
+
+        channel_name = f"deal-{match.match_id}"
+        channel = await guild.create_text_channel(
+            channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic="Temporary private NFT buyer/seller deal channel.",
+            reason="NFT Market Bot matched buyer and seller",
+        )
+        logger.info(
+            "Created private deal channel '%s' (id=%s) under category '%s' in guild=%s. "
+            "Allowed members: seller=%s, buyer=%s, bot=%s.",
+            channel.name,
+            channel.id,
+            category.name,
+            guild.id,
+            seller.id,
+            buyer.id,
+            bot_member.id,
+        )
+        return channel
+
+    async def delete_deal_channel_later(
+        self, channel: discord.TextChannel, match: Match
+    ) -> None:
+        await asyncio.sleep(DEAL_CHANNEL_TTL_HOURS * 60 * 60)
+        try:
+            await channel.delete(reason="NFT Market Bot temporary deal expired")
+            match.closed_at = utc_now()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.info("Deal channel %s was already closed or could not be deleted.", channel.id)
+
+    async def fetch_user_safely(self, user_id: int) -> Optional[discord.User]:
+        if not self.is_ready():
+            return None
+        try:
+            return await self.fetch_user(user_id)
+        except (discord.NotFound, discord.HTTPException, Exception):
+            logger.info("Could not fetch Discord user %s.", user_id)
+            return None
+
+    @staticmethod
+    def match_embed(match: Match) -> discord.Embed:
+        embed = discord.Embed(
+            title="NFT Market match found",
+            description=(
+                f"A buyer and seller matched for **{match.seller.collection}**. "
+                "Keep the conversation inside the private deal channel."
+            ),
+            color=discord.Color.green(),
+            timestamp=match.created_at,
+        )
+        embed.add_field(
+            name="Seller price",
+            value=format_amount(match.seller.amount, match.seller.currency),
+            inline=True,
+        )
+        embed.add_field(name="Seller details", value=match.seller.details, inline=False)
+        embed.add_field(
+            name="NFT mint address",
+            value=match.seller.mint_address or "No mint address provided",
+            inline=False,
+        )
+        embed.add_field(name="Match ID", value=match.match_id, inline=True)
+        return embed
+
+
+bot = NFTMarketBot()
+
+
+@bot.tree.command(name="sell", description="Register an NFT you want to sell.")
+@app_commands.guild_only()
+async def sell(interaction: discord.Interaction) -> None:
+    await interaction.response.send_modal(SellModal())
+
+
+@bot.tree.command(name="buy", description="Register an NFT you want to buy.")
+@app_commands.guild_only()
+async def buy(interaction: discord.Interaction) -> None:
+    await interaction.response.send_modal(BuyModal())
+
+
+@bot.tree.command(name="matches", description="Show your current private matches.")
+@app_commands.guild_only()
+async def matches(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    new_matches = STORE.reconcile(guild.id)
+    for match in new_matches:
+        await bot.complete_match(guild, match)
+
+    user_matches = STORE.matches_for_user(interaction.user.id)
+    if not user_matches:
+        await interaction.followup.send(
+            "You do not have any matches yet.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="Your NFT Market matches",
+        description="Only you can see this response.",
+        color=discord.Color.blurple(),
+    )
+    for match in user_matches[-10:]:
+        other_person = (
+            match.seller.user_name
+            if match.buyer.user_id == interaction.user.id
+            else match.buyer.user_name
+        )
+        channel_text = match.channel_name or "Private channel unavailable"
+        embed.add_field(
+            name=f"{match.seller.collection} · {match.match_id}",
+            value=(
+                f"Other party: **{other_person}**\n"
+                f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**\n"
+                f"Deal channel: {channel_text}"
+            ),
+            inline=False,
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="cancel", description="Cancel an active buy or sell request.")
+@app_commands.guild_only()
+@app_commands.describe(request_type="Which active request should be cancelled?")
+@app_commands.choices(
+    request_type=[
+        app_commands.Choice(name="Buy request", value="buy"),
+        app_commands.Choice(name="Sell request", value="sell"),
+        app_commands.Choice(name="Both", value="both"),
+    ]
+)
+async def cancel(
+    interaction: discord.Interaction, request_type: app_commands.Choice[str]
+) -> None:
+    cancelled = STORE.cancel_latest(interaction.user.id, request_type.value)
+    if not cancelled:
+        await interaction.response.send_message(
+            f"You have no active {request_type.name.lower()} to cancel.",
+            ephemeral=True,
+        )
+        return
+
+    names = ", ".join(f"{item.kind} for {item.collection}" for item in cancelled)
+    await interaction.response.send_message(
+        f"Cancelled: **{names}**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.interaction_check
+async def on_tree_interaction_check(interaction: discord.Interaction) -> bool:
+    cmd = interaction.command.name if interaction.command else str(interaction.data)
+    user_str = f"{interaction.user} (ID: {interaction.user.id})"
+    channel_str = f"#{interaction.channel} (ID: {interaction.channel_id})" if interaction.channel else f"channel {interaction.channel_id}"
+    guild_str = f"{interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "Direct Message"
+    logger.info("⚡ Slash command /%s invoked by %s in %s on guild %s", cmd, user_str, channel_str, guild_str)
+    return True
+
+
+@bot.tree.command(name="wallet", description="Verify ownership of your Solana wallet via cryptographic signature.")
+async def wallet(interaction: discord.Interaction) -> None:
+    """Send a secure one-time verification link with button."""
+    # Defer immediately: Discord requires an ack within 3s, and creating the
+    # Supabase session below is a network call that can exceed that window.
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        session = await WALLET_STORE.create_session(interaction.user.id)
+        url = bot.wallet_url(session.token)
+    except Exception:
+        logger.exception(
+            "Wallet session creation failed for user=%s", interaction.user.id
+        )
+        await interaction.edit_original_response(
+            content="⚠️ La vérification du wallet est temporairement indisponible. "
+            "Réessayez dans quelques instants."
+        )
+        return
+
+    logger.info(
+        "Created verification session %s for user=%s; URL=%s",
+        session.token[:8],
+        interaction.user.id,
+        url,
+    )
+    if url is None:
+        await interaction.edit_original_response(
+            content="⚠️ The verification server URL is not configured. "
+            "Please check WALLET_VERIFY_BASE_URL or APP_URL in your environment."
+        )
+        return
+
+    embed = discord.Embed(
+        title="🔐 Verify Solana Wallet",
+        description=(
+            "Click the button below to connect your Solana wallet (Phantom, etc.) "
+            "and sign a cryptographic proof of ownership.\n\n"
+            "⚠️ **Safety Notice:** NFT Market will **NEVER** ask for your seed phrase, "
+            "private key, or wallet password. Only message signature is requested."
+        ),
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text="Link expires in 5 minutes.")
+    view = WalletVerifyView(url)
+    await interaction.edit_original_response(embed=embed, view=view)
+
+
+@bot.tree.command(name="wallet-status", description="Check if your Solana wallet is verified.")
+async def wallet_status(interaction: discord.Interaction) -> None:
+    """Display verification status for the calling user."""
+    association = await WALLET_STORE.get_association(interaction.user.id)
+    if association is None:
+        await interaction.response.send_message(
+            "❌ **Wallet verified:** Non\n"
+            "Use `/wallet` to connect and verify your Solana address.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "✅ **Wallet vérifié :** Oui\n"
+        f"**Adresse publique :** `{short_public_key(association.public_key)}`\n"
+        f"**Date de vérification :** {association.verified_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+        "ℹ️ *Ce statut prouve uniquement le contrôle de l'adresse Solana.*",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="wallet-remove", description="Unlink your verified Solana wallet from your Discord account.")
+async def wallet_remove(interaction: discord.Interaction) -> None:
+    """Remove wallet association for the calling user."""
+    association = await WALLET_STORE.remove_association(interaction.user.id)
+    if association is None:
+        await interaction.response.send_message(
+            "You do not have any verified wallet associated with your Discord account.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"🗑️ The wallet `{short_public_key(association.public_key)}` has been unlinked from your account.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="help", description="Explain the NFT Market Bot commands.")
+async def help_command(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="NFT Market Bot",
+        description="A private buyer/seller matching and Solana verified network.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="/sell", value="Register an NFT you want to sell.", inline=False)
+    embed.add_field(name="/buy", value="Register an NFT you want to buy.", inline=False)
+    embed.add_field(name="/matches", value="View your current matches privately.", inline=False)
+    embed.add_field(name="/cancel", value="Cancel an active buy or sell request.", inline=False)
+    embed.add_field(name="/wallet", value="Connect and cryptographically verify your Solana wallet.", inline=False)
+    embed.add_field(name="/wallet-status", value="Check if your wallet is verified.", inline=False)
+    embed.add_field(name="/wallet-remove", value="Unlink your wallet from your account.", inline=False)
+    embed.add_field(name="/ping", value="Check the bot latency.", inline=False)
+    embed.set_footer(text="Cryptographic Ed25519 signatures verify address control without sharing private keys.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="ping", description="Return the bot latency.")
+async def ping(interaction: discord.Interaction) -> None:
+    latency_ms = round(bot.latency * 1000)
+    logger.info("Pong answered for user=%s: %d ms", interaction.user.id, latency_ms)
+    await interaction.response.send_message(
+        f"Pong! Latency: **{latency_ms} ms**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    original = getattr(error, "original", error)
+    if isinstance(original, discord.Forbidden):
+        message = (
+            "Discord denied that action. Please check that the bot can manage "
+            "channels and send messages."
+        )
+    elif isinstance(original, discord.HTTPException):
+        message = "Discord could not complete that action. Please try again in a moment."
+    else:
+        logger.exception("Unhandled slash command error", exc_info=original)
+        message = "Something went wrong while processing that command."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+@bot.event
+async def on_ready() -> None:
+    if not bot.ready_message_sent:
+        bot.ready_message_sent = True
+        logger.info("Connected to Discord as %s (ID: %s).", bot.user, bot.user.id if bot.user else "unknown")
+        for guild in bot.guilds:
+            if guild.me is None:
+                logger.error(
+                    "Bot member is unavailable in guild=%s (%s); private deal "
+                    "channels cannot be created there.",
+                    guild.id,
+                    guild.name,
+                )
+                continue
+            permissions = guild.me.guild_permissions
+            missing = [
+                name
+                for name, granted in {
+                    "View Channel": permissions.view_channel,
+                    "Send Messages": permissions.send_messages,
+                    "Embed Links": permissions.embed_links,
+                    "Read Message History": permissions.read_message_history,
+                    "Manage Channels": permissions.manage_channels,
+                    "Manage Roles": permissions.manage_roles,
+                }.items()
+                if not granted
+            ]
+            if missing:
+                logger.error(
+                    "Private deal channel permissions missing in guild=%s (%s): %s.",
+                    guild.id,
+                    guild.name,
+                    ", ".join(missing),
+                )
+            else:
+                logger.info(
+                    "Private deal channel permissions verified in guild=%s (%s).",
+                    guild.id,
+                    guild.name,
+                )
+        logger.info("NFT Market Bot is ready.")
+
+
+def main() -> None:
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        print(
+            "DISCORD_TOKEN is not set. Add it to your environment secrets, then run the bot again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    bot.run(token, log_handler=None)
+
+
+if __name__ == "__main__":
+    main()
