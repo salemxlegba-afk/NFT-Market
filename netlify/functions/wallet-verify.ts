@@ -96,23 +96,44 @@ export const handler: Handler = async (event) => {
       return { statusCode: 400, headers, body: JSON.stringify({ ok: false, error: "La signature cryptographique fournie est invalide." }) };
     }
 
-    // 5. Enregistrer l'association dans Supabase
-    await fetch(`${SUPABASE_URL}/rest/v1/wallet_associations`, {
-      method: "POST",
-      headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates,return=representation" },
-      body: JSON.stringify({
-        discord_user_id: session.discord_user_id,
-        public_key: publicKey,
-        verified_at: new Date().toISOString(),
-      }),
-    });
+    // 5. Enregistrer l'association dans Supabase (on_conflict explicite + vérification du statut HTTP)
+    //    FIX: le code précédent n'attendait pas et ne vérifiait pas cette écriture, donc une erreur
+    //    Supabase silencieuse laissait passer un "succès" côté frontend sans rien enregistrer.
+    const assocRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/wallet_associations?on_conflict=discord_user_id`,
+      {
+        method: "POST",
+        headers: { ...sbHeaders, Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          discord_user_id: session.discord_user_id,
+          public_key: publicKey,
+          verified_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!assocRes.ok) {
+      const errText = await assocRes.text();
+      return {
+        statusCode: 500,
+        headers,
+        body: JSON.stringify({ ok: false, error: "Échec de l'enregistrement Supabase: " + errText }),
+      };
+    }
 
-    // 6. Marquer la session comme utilisée
-    await fetch(`${SUPABASE_URL}/rest/v1/wallet_sessions?token=eq.${encodeURIComponent(sessionToken)}`, {
+    // 6. Marquer la session comme utilisée (également vérifié désormais)
+    const usedRes = await fetch(`${SUPABASE_URL}/rest/v1/wallet_sessions?token=eq.${encodeURIComponent(sessionToken)}`, {
       method: "PATCH",
       headers: sbHeaders,
       body: JSON.stringify({ used: true }),
     });
+    if (!usedRes.ok) {
+      const errText = await usedRes.text();
+      return {
+        statusCode: 500,
+        headers,
+        body: JSON.stringify({ ok: false, error: "Échec de la clôture de session: " + errText }),
+      };
+    }
 
     return {
       statusCode: 200,
