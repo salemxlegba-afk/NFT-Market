@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <script>
+      (function() {
+        try {
+          var originalFetch = window.fetch;
+          Object.defineProperty(window, 'fetch', {
+            get: function() {
+              return originalFetch;
+            },
+            set: function(newFetch) {
+              originalFetch = newFetch;
+            },
+            configurable: true,
+            enumerable: true
+          });
+        } catch (e) {
+          // ignore if already defined
+        }
+      })();
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NFT Market</title>
+    <meta name="description" content="Plateforme et bot Discord NFT Market avec vérification de wallet Solana par signature cryptographique et matching acheteur/vendeur." />
+    <meta property="og:title" content="NFT Market" />
+    <meta property="og:description" content="Plateforme et bot Discord NFT Market avec vérification de wallet Solana par signature cryptographique et matching acheteur/vendeur." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
