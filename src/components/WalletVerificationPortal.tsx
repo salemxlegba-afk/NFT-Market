@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldCheck, Wallet, AlertCircle, CheckCircle2, Lock, RefreshCw, KeyRound, ExternalLink } from 'lucide-react';
-import { verifySolanaSignature, shortKey } from '../lib/solana-verify';
+import { shortKey } from '../lib/solana-verify';
 import type { VerifiedWalletRecord } from '../types';
 
 interface PhantomProvider {
@@ -23,6 +23,10 @@ export const WalletVerificationPortal: React.FC = () => {
   const [nonce, setNonce] = useState<string>('');
   const [expiresAt, setExpiresAt] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
+  // FIX: track whether we have a real, server-confirmed session. Without this,
+  // the portal used to silently fall back to a fake local "demo" session and
+  // still let the user "sign" it, showing a false success message.
+  const [sessionError, setSessionError] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' | '' }>({ text: '', type: '' });
   const [verifiedRecord, setVerifiedRecord] = useState<VerifiedWalletRecord | null>(null);
 
@@ -32,10 +36,9 @@ export const WalletVerificationPortal: React.FC = () => {
     const session = params.get('session');
     if (session) {
       setSessionToken(session);
-      // Fetch or simulate session message retrieval
       fetchSessionData(session);
     } else {
-      // Default playground session
+      // Default playground session (no real Discord session in the URL)
       generateNewSession('102938475610293847');
     }
   }, []);
@@ -52,6 +55,7 @@ export const WalletVerificationPortal: React.FC = () => {
     setDiscordId(initialDiscordId);
     setNonce(randomNonce);
     setExpiresAt(exp);
+    setSessionError(false);
     setStatusMessage({ text: 'Nouvelle session de vérification initialisée. Prêt pour signature.', type: 'info' });
   };
 
@@ -67,13 +71,17 @@ export const WalletVerificationPortal: React.FC = () => {
         setDiscordId(dId);
         setNonce(nnce);
         setExpiresAt(new Date(data.expiresAt).toLocaleTimeString());
+        setSessionError(false);
         setStatusMessage({ text: 'Message sécurisé chargé depuis le serveur.', type: 'info' });
       } else {
-        // Fallback for standalone demo if backend aiohttp isn't on the same port
-        generateNewSession('DiscordUser_' + token.slice(0, 6));
+        // FIX: a real Discord session was requested but is invalid/expired.
+        // Do NOT silently switch to a fake demo session — tell the user.
+        setSessionError(true);
+        setStatusMessage({ text: 'Ce lien de vérification est invalide ou a expiré. Relancez /wallet sur Discord.', type: 'error' });
       }
     } catch {
-      generateNewSession('DiscordUser_' + token.slice(0, 6));
+      setSessionError(true);
+      setStatusMessage({ text: 'Impossible de contacter le serveur de vérification. Réessayez.', type: 'error' });
     } finally {
       setLoading(false);
     }
@@ -107,6 +115,11 @@ export const WalletVerificationPortal: React.FC = () => {
       return;
     }
 
+    if (sessionError || !sessionToken || !nonce) {
+      setStatusMessage({ text: 'Session de vérification invalide ou expirée. Relancez /wallet sur Discord.', type: 'error' });
+      return;
+    }
+
     try {
       setLoading(true);
       setStatusMessage({ text: 'Connexion au portefeuille Solana...', type: 'info' });
@@ -121,23 +134,34 @@ export const WalletVerificationPortal: React.FC = () => {
 
       const encodedMessage = new TextEncoder().encode(messageToSign);
       const signedData = await provider.signMessage(encodedMessage, 'utf8');
-
       const signatureBytes = signedData.signature || (signedData as unknown as Uint8Array);
 
-      // Perform real cryptographic verification
-      setStatusMessage({ text: 'Vérification cryptographique Ed25519 de la signature...', type: 'info' });
-      const isValid = verifySolanaSignature(messageToSign, signatureBytes, pubKey);
-
-      if (!isValid) {
-        throw new Error('La signature cryptographique fournie est invalide ou ne correspond pas à la clé publique.');
-      }
-
-      // Encode signature to base64
       let binary = '';
       for (let i = 0; i < signatureBytes.length; i++) {
         binary += String.fromCharCode(signatureBytes[i]);
       }
       const signatureB64 = btoa(binary);
+
+      // FIX: the server (wallet-verify.ts) is the single source of truth. We wait
+      // for its confirmed, checked response before declaring success — previously
+      // this call was fire-and-forget and its failure was silently swallowed while
+      // the UI already showed "verified", even though nothing was saved.
+      setStatusMessage({ text: 'Vérification cryptographique Ed25519 côté serveur...', type: 'info' });
+
+      const verifyRes = await fetch('/api/wallet/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session: sessionToken,
+          publicKey: pubKey,
+          signature: signatureB64,
+        }),
+      });
+      const verifyData = await verifyRes.json();
+
+      if (!verifyRes.ok || !verifyData.ok) {
+        throw new Error(verifyData.error || 'La vérification serveur a échoué.');
+      }
 
       const record: VerifiedWalletRecord = {
         discordUserId: discordId,
@@ -149,24 +173,9 @@ export const WalletVerificationPortal: React.FC = () => {
 
       setVerifiedRecord(record);
       setStatusMessage({
-        text: '✅ Portefeuille Solana vérifié avec succès par signature cryptographique !',
+        text: '✅ Portefeuille Solana vérifié avec succès et enregistré.',
         type: 'success',
       });
-
-      // Also try posting to backend if reachable
-      try {
-        await fetch('/api/wallet/verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            session: sessionToken,
-            publicKey: pubKey,
-            signature: signatureB64,
-          }),
-        });
-      } catch {
-        // Backend optional for client preview verification
-      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Échec de la signature ou annulation par l\'utilisateur.';
       setStatusMessage({ text: msg, type: 'error' });
@@ -261,7 +270,7 @@ export const WalletVerificationPortal: React.FC = () => {
       <div className="flex flex-col sm:flex-row gap-3">
         <button
           onClick={handleConnectAndSign}
-          disabled={loading}
+          disabled={loading || sessionError}
           className="flex-1 flex items-center justify-center gap-2.5 py-3.5 px-6 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:opacity-50 text-white font-semibold shadow-lg shadow-indigo-600/25 transition cursor-pointer"
         >
           <Wallet className="w-5 h-5" />
