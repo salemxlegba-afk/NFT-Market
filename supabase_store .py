@@ -401,5 +401,3 @@ def get_stores():
         logger.info("ℹ️ Supabase not configured -> Using default InMemoryStore fallback")
         from main import InMemoryStore, WalletStore
         return InMemoryStore(), WalletStore()
-
-
