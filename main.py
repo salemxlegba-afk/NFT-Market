@@ -846,18 +846,94 @@ class NFTMarketBot(commands.Bot):
             self.wallet_web_runner = None
         await super().close()
 
+    VERIFIED_ROLE_NAME = "NFT Market Verified"
+
+    async def grant_verified_access(self, association: WalletAssociation) -> list[str]:
+        """Give a verified wallet the Discord role that unlocks the private market.
+
+        The role is created once per guild and is also granted visibility on the
+        existing private-market category. The bot never grants administrator or
+        moderation permissions through this role.
+        """
+        if not self.is_ready():
+            return []
+
+        granted: list[str] = []
+        for guild in self.guilds:
+            try:
+                member = guild.get_member(association.discord_user_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(association.discord_user_id)
+                    except discord.NotFound:
+                        continue
+
+                role = discord.utils.get(guild.roles, name=self.VERIFIED_ROLE_NAME)
+                if role is None:
+                    if not guild.me or not guild.me.guild_permissions.manage_roles:
+                        logger.warning("Cannot create verified role in guild=%s: Manage Roles missing.", guild.id)
+                        continue
+                    role = await guild.create_role(
+                        name=self.VERIFIED_ROLE_NAME,
+                        mentionable=False,
+                        hoist=False,
+                        reason="NFT Market verified Solana wallet access",
+                    )
+                    logger.info("Created verified role '%s' in guild=%s.", role.name, guild.id)
+
+                bot_member = guild.me
+                if bot_member is None or role >= bot_member.top_role:
+                    logger.warning(
+                        "Cannot assign verified role in guild=%s: role hierarchy is too high.", guild.id
+                    )
+                    continue
+
+                if role not in member.roles:
+                    await member.add_roles(role, reason="Solana wallet cryptographically verified")
+
+                category = discord.utils.find(
+                    lambda c: c.name.strip() == PRIVATE_MARKET_CATEGORY, guild.categories
+                )
+                if category is not None:
+                    await category.set_permissions(
+                        role,
+                        view_channel=True,
+                        reason="Verified wallet access to private NFT Market",
+                    )
+
+                granted.append(guild.name)
+                logger.info(
+                    "Granted verified NFT Market access to user=%s in guild=%s.",
+                    association.discord_user_id, guild.id
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning(
+                    "Could not grant verified access for user=%s in guild=%s.",
+                    association.discord_user_id, guild.id, exc_info=True
+                )
+
+        return granted
+
     async def notify_wallet_verified(self, association: WalletAssociation) -> None:
         if not self.is_ready():
             return
+
+        granted_guilds = await self.grant_verified_access(association)
         user = await self.fetch_user_safely(association.discord_user_id)
         if user is None:
             return
         try:
+            access_text = (
+                "\n🔓 **Accès NFT Market activé.**"
+                if granted_guilds
+                else "\n⚠️ Wallet vérifié, mais l'accès au réseau privé n'a pas pu être attribué automatiquement. Contactez un administrateur."
+            )
             await user.send(
                 "✅ Wallet verified successfully.\n"
                 f"Public address: `{short_public_key(association.public_key)}`\n"
                 f"Verified at: {association.verified_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
                 "This confirms control of the Solana address only. It does not verify ownership of an NFT Pass."
+                + access_text
             )
         except (discord.Forbidden, discord.HTTPException, Exception):
             logger.warning(
@@ -1226,21 +1302,42 @@ class NFTMarketBot(commands.Bot):
 bot = NFTMarketBot()
 
 
+async def require_verified_wallet(interaction: discord.Interaction) -> bool:
+    association = await WALLET_STORE.get_association(interaction.user.id)
+    if association is not None:
+        return True
+    message = (
+        "🔐 **Wallet verification required.**\n"
+        "Verify your Solana wallet with `/wallet` before using the private NFT Market."
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    return False
+
+
 @bot.tree.command(name="sell", description="Register an NFT you want to sell.")
 @app_commands.guild_only()
 async def sell(interaction: discord.Interaction) -> None:
+    if not await require_verified_wallet(interaction):
+        return
     await interaction.response.send_modal(SellModal())
 
 
 @bot.tree.command(name="buy", description="Register an NFT you want to buy.")
 @app_commands.guild_only()
 async def buy(interaction: discord.Interaction) -> None:
+    if not await require_verified_wallet(interaction):
+        return
     await interaction.response.send_modal(BuyModal())
 
 
 @bot.tree.command(name="matches", description="Show your current private matches.")
 @app_commands.guild_only()
 async def matches(interaction: discord.Interaction) -> None:
+    if not await require_verified_wallet(interaction):
+        return
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message(
@@ -1299,6 +1396,8 @@ async def matches(interaction: discord.Interaction) -> None:
 async def cancel(
     interaction: discord.Interaction, request_type: app_commands.Choice[str]
 ) -> None:
+    if not await require_verified_wallet(interaction):
+        return
     cancelled = STORE.cancel_latest(interaction.user.id, request_type.value)
     if not cancelled:
         await interaction.response.send_message(
