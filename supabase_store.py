@@ -240,6 +240,169 @@ class SupabaseMarketStore:
         )
 
 
+    @staticmethod
+    def _compatible(seller: Any, buyer: Any) -> bool:
+        from main import compatible_collection
+        return (
+            seller.active
+            and buyer.active
+            and seller.guild_id == buyer.guild_id
+            and seller.currency == buyer.currency
+            and buyer.amount >= seller.amount
+            and compatible_collection(buyer.collection, seller.collection)
+        )
+
+    @staticmethod
+    def _listing_from_row(r: Dict[str, Any]) -> Any:
+        from main import Listing
+        return Listing(
+            listing_id=r["listing_id"],
+            kind=r["kind"],
+            guild_id=int(r["guild_id"]),
+            user_id=int(r["user_id"]),
+            user_name=r["user_name"],
+            collection=r["collection"],
+            currency=r["currency"],
+            amount=Decimal(str(r["amount"])),
+            details=r.get("details") or "",
+            mint_address=r.get("mint_address") or "",
+            active=bool(r["active"]),
+            created_at=datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")),
+        )
+
+    async def _find_compatible(self, listing: Any, opposite_kind: str) -> Optional[Any]:
+        records = await self.client.get(
+            "market_listings",
+            params={
+                "guild_id": f"eq.{listing.guild_id}",
+                "kind": f"eq.{opposite_kind}",
+                "active": "eq.true",
+                "order": "created_at.asc",
+            },
+        )
+        for row in records:
+            candidate = self._listing_from_row(row)
+            seller, buyer = (listing, candidate) if listing.kind == "sell" else (candidate, listing)
+            if self._compatible(seller, buyer):
+                return candidate
+        return None
+
+    async def _create_match(self, seller: Any, buyer: Any) -> Any:
+        from main import Match
+        seller.active = False
+        buyer.active = False
+        await self.deactivate_listing(seller.listing_id)
+        await self.deactivate_listing(buyer.listing_id)
+        match = Match(
+            match_id=__import__("uuid").uuid4().hex[:8],
+            guild_id=seller.guild_id,
+            seller=seller,
+            buyer=buyer,
+        )
+        await self.add_match(match)
+        return match
+
+    async def add_sell_request(self, listing: Any) -> Optional[Any]:
+        await self.add_listing(listing)
+        buyer = await self._find_compatible(listing, "buy")
+        if buyer is None:
+            return None
+        return await self._create_match(listing, buyer)
+
+    async def add_buy_request(self, listing: Any) -> Optional[Any]:
+        await self.add_listing(listing)
+        seller = await self._find_compatible(listing, "sell")
+        if seller is None:
+            return None
+        return await self._create_match(seller, listing)
+
+    async def reconcile(self, guild_id: int) -> List[Any]:
+        from main import Match
+        listings = await self.get_active_listings(guild_id)
+        sellers = [x for x in listings if x.kind == "sell" and x.active]
+        buyers = [x for x in listings if x.kind == "buy" and x.active]
+        created: List[Any] = []
+        for seller in sellers:
+            if not seller.active:
+                continue
+            buyer = next((b for b in buyers if b.active and self._compatible(seller, b)), None)
+            if buyer is None:
+                continue
+            match = await self._create_match(seller, buyer)
+            created.append(match)
+        return created
+
+    async def cancel_latest(self, user_id: int, request_type: str) -> List[Any]:
+        records = await self.client.get(
+            "market_listings",
+            params={
+                "user_id": f"eq.{user_id}",
+                "active": "eq.true",
+                "order": "created_at.desc",
+            },
+        )
+        cancelled: List[Any] = []
+        for row in records:
+            if request_type != "both" and row["kind"] != request_type:
+                continue
+            listing = self._listing_from_row(row)
+            await self.deactivate_listing(listing.listing_id)
+            listing.active = False
+            cancelled.append(listing)
+            if request_type != "both":
+                break
+        return cancelled
+
+    async def active_counts(self, guild_id: int) -> tuple[int, int]:
+        records = await self.client.get(
+            "market_listings",
+            params={"guild_id": f"eq.{guild_id}", "active": "eq.true"},
+        )
+        buyers = {int(r["user_id"]) for r in records if r["kind"] == "buy"}
+        sellers = {int(r["user_id"]) for r in records if r["kind"] == "sell"}
+        return len(buyers), len(sellers)
+
+    async def active_requests_for_user(self, guild_id: int, user_id: int) -> List[Any]:
+        records = await self.client.get(
+            "market_listings",
+            params={
+                "guild_id": f"eq.{guild_id}",
+                "user_id": f"eq.{user_id}",
+                "active": "eq.true",
+                "order": "created_at.desc",
+            },
+        )
+        return [self._listing_from_row(r) for r in records]
+
+    async def matches_for_user(self, user_id: int) -> List[Any]:
+        from main import Match
+        records = await self.client.get(
+            "market_matches",
+            params={"order": "created_at.desc"},
+        )
+        matches: List[Any] = []
+        for mr in records:
+            s_res = await self.client.get("market_listings", params={"listing_id": f"eq.{mr['seller_listing_id']}"})
+            b_res = await self.client.get("market_listings", params={"listing_id": f"eq.{mr['buyer_listing_id']}"})
+            if not s_res or not b_res:
+                continue
+            seller = self._listing_from_row(s_res[0])
+            buyer = self._listing_from_row(b_res[0])
+            if seller.user_id != user_id and buyer.user_id != user_id:
+                continue
+            matches.append(Match(
+                match_id=mr["match_id"],
+                guild_id=int(mr["guild_id"]),
+                seller=seller,
+                buyer=buyer,
+                channel_id=int(mr["channel_id"]) if mr.get("channel_id") else None,
+                channel_name=mr.get("channel_name"),
+                created_at=datetime.fromisoformat(mr["created_at"].replace("Z", "+00:00")),
+                closed_at=datetime.fromisoformat(mr["closed_at"].replace("Z", "+00:00")) if mr.get("closed_at") else None,
+            ))
+        return matches
+
+
 class SupabaseWalletStore:
     """Supabase-backed Wallet Store for verification sessions and linked wallets."""
 
