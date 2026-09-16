@@ -1461,7 +1461,7 @@ async def matches(interaction: discord.Interaction) -> None:
             value=(
                 f"Other party: **{other_person}**\n"
                 f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**\n"
-                f"Status: **{getattr(match, "status", "MATCHED")}**\n"
+                f"Status: **{getattr(match, 'status', 'MATCHED')}**\n"
                 f"Deal channel: {channel_text}"
             ),
             inline=False,
