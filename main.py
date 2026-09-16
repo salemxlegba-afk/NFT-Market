@@ -563,7 +563,24 @@ class WalletVerifyView(discord.ui.View):
                 url=url,
             )
         )
+class WalletVerifyPromptView(discord.ui.View):
+    """Prompt shown when a user tries to buy/sell without a verified wallet."""
 
+    def __init__(self) -> None:
+        super().__init__(timeout=10 * 60)
+
+    @discord.ui.button(
+        label="Verify My Wallet",
+        emoji="🔐",
+        style=discord.ButtonStyle.primary,
+        custom_id="nftmarket:wallet:verify_prompt",
+    )
+    async def verify_my_wallet(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await send_wallet_verification_link(interaction)
 
 class InMemoryStore:
     """In-memory fallback store with the same async interface as SupabaseMarketStore."""
