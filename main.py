@@ -1391,14 +1391,28 @@ async def require_verified_wallet(interaction: discord.Interaction) -> bool:
     association = await WALLET_STORE.get_association(interaction.user.id)
     if association is not None:
         return True
+
     message = (
         "🔐 **Wallet verification required.**\n"
-        "Verify your Solana wallet with `/wallet` before using the private NFT Market."
+        "You must verify your Solana wallet before using the private NFT Market.\n\n"
+        "Click **Verify My Wallet** below to connect your wallet and sign the verification message."
     )
+
+    view = WalletVerifyPromptView()
+
     if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(
+            message,
+            view=view,
+            ephemeral=True,
+        )
     else:
-        await interaction.response.send_message(message, ephemeral=True)
+        await interaction.response.send_message(
+            message,
+            view=view,
+            ephemeral=True,
+        )
+
     return False
 
 
