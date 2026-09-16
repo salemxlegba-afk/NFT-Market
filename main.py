@@ -1455,7 +1455,7 @@ async def matches(interaction: discord.Interaction) -> None:
             if match.buyer.user_id == interaction.user.id
             else match.buyer.user_name
         )
-        channel_text = match.channel_name or "Private channel unavailable"
+        channel_text = match.channel_name or f"deal-{match.match_id}"
         embed.add_field(
             name=f"{match.seller.collection} · {match.match_id}",
             value=(
