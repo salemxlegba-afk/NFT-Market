@@ -1331,6 +1331,31 @@ class NFTMarketBot(commands.Bot):
         if isinstance(channel, discord.TextChannel):
             try:
                 await channel.send(f"🔒 Deal closed: **{status}**.")
+                if status == "CANCELLED":
+                    guild = interaction.guild
+                    if guild is not None:
+                        menu_channel = next(
+                            (
+                                candidate
+                                for candidate in guild.text_channels
+                                if candidate.name.endswith("bot-commands")
+                            ),
+                            None,
+                        )
+                        if menu_channel is not None:
+                            buyer_count, seller_count = await STORE.active_counts(guild.id)
+                            embed = discord.Embed(
+                                title="🖼️ NFT Market",
+                                description=(
+                                    "❌ **Deal cancelled successfully.**\n\n"
+                                    "You can continue using the NFT Market below.\n\n"
+                                    f"🟢 **Active Buyers: {buyer_count}**\n"
+                                    f"🔴 **Active Sellers: {seller_count}**\n\n"
+                                    "The counters represent users who currently have an active request."
+                                ),
+                                color=discord.Color.blurple(),
+                            )
+                            await menu_channel.send(embed=embed, view=MainMenuView())
                 await asyncio.sleep(2)
                 await channel.delete(reason=f"NFT Market deal {status.lower()}")
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
