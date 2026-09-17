@@ -185,8 +185,8 @@ class SupabaseMarketStore:
         payload = {
             "match_id": match.match_id,
             "guild_id": match.guild_id,
-            "seller_listing_id": match.seller_listing_id,
-            "buyer_listing_id": match.buyer_listing_id,
+            "seller_listing_id": match.seller.listing_id,
+            "buyer_listing_id": match.buyer.listing_id,
             "channel_id": match.channel_id,
             "channel_name": match.channel_name,
             "created_at": match.created_at.isoformat(),
