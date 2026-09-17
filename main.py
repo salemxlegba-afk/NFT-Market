@@ -1356,7 +1356,7 @@ class NFTMarketBot(commands.Bot):
                                 color=discord.Color.blurple(),
                             )
                             await menu_channel.send(embed=embed, view=MainMenuView())
-                await asyncio.sleep(2)
+                await asyncio.sleep(60)
                 await channel.delete(reason=f"NFT Market deal {status.lower()}")
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
