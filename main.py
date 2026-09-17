@@ -543,7 +543,6 @@ async def wallet_verify(request: web.Request) -> web.Response:
             association.discord_user_id,
             exc,
         )
-
     return web.json_response(
         {
             "ok": True,
@@ -564,8 +563,6 @@ class WalletVerifyView(discord.ui.View):
                 url=url,
             )
         )
-
-
 class WalletVerifyPromptView(discord.ui.View):
     """Prompt shown when a user tries to buy/sell without a verified wallet."""
 
@@ -584,7 +581,6 @@ class WalletVerifyPromptView(discord.ui.View):
         button: discord.ui.Button,
     ) -> None:
         await send_wallet_verification_link(interaction)
-
 
 class InMemoryStore:
     """In-memory fallback store with the same async interface as SupabaseMarketStore."""
@@ -675,8 +671,7 @@ class InMemoryStore:
 
     async def matches_for_user(self, user_id: int) -> list[Match]:
         return [
-            match
-            for match in self.matches
+            match for match in self.matches
             if match.seller.user_id == user_id or match.buyer.user_id == user_id
         ]
 
@@ -790,132 +785,7 @@ async def report_modal_error(
     else:
         await interaction.response.send_message(message, ephemeral=True)
 
-class TradeChoiceView(discord.ui.View):
-    """Shows the live opposite-side count before opening the trade form."""
 
-    def __init__(self, mode: str, guild_id: int) -> None:
-        super().__init__(timeout=120)
-        self.mode = mode
-        self.guild_id = guild_id
-
-    @discord.ui.button(
-        label="Continue",
-        style=discord.ButtonStyle.success,
-        custom_id="nftmarket:trade:continue",
-    )
-    async def continue_trade(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        await interaction.response.send_modal(
-            BuyModal() if self.mode == "buy" else SellModal()
-        )
-
-    @discord.ui.button(
-        label="Refresh",
-        style=discord.ButtonStyle.secondary,
-        custom_id="nftmarket:trade:refresh",
-    )
-    async def refresh(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        buyer_count, seller_count = await STORE.active_counts(self.guild_id)
-
-        if self.mode == "buy":
-            content = (
-                f"🔎 **Buy an NFT**\n\n"
-                f"🔴 **{seller_count} active sellers currently.**\n\n"
-                "Click **Continue** to create your request."
-            )
-        else:
-            content = (
-                f"📤 **Sell an NFT**\n\n"
-                f"🟢 **{buyer_count} active buyers currently.**\n\n"
-                "Click **Continue** to list your NFT."
-            )
-
-        await interaction.response.edit_message(
-            content=content,
-            view=self,
-        )
-
-class MainMenuView(discord.ui.View):
-    """Persistent NFT Market button menu."""
-
-    def __init__(self) -> None:
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Verify Wallet", emoji="🔐", style=discord.ButtonStyle.primary, custom_id="nftmarket:menu:verify_wallet", row=0)
-    async def verify_wallet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await send_wallet_verification_link(interaction)
-
-    @discord.ui.button(label="My Wallet", emoji="👛", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:my_wallet", row=0)
-    async def my_wallet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await send_wallet_status(interaction)
-
-    @discord.ui.button(label="I Want to Buy", emoji="🟢", style=discord.ButtonStyle.success, custom_id="nftmarket:menu:buy", row=1)
-    async def want_buy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        guild = interaction.guild
-        buyer_count, seller_count = await STORE.active_counts(guild.id) if guild else (0, 0)
-        await interaction.response.send_message(
-            f"🔎 **Buy an NFT**\n\n🔴 **{seller_count} active sellers currently.**\n\nClick **Continue** to create your request.",
-            view=TradeChoiceView("buy", guild.id if guild else 0),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="I Want to Sell", emoji="🔴", style=discord.ButtonStyle.danger, custom_id="nftmarket:menu:sell", row=1)
-    async def want_sell(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        guild = interaction.guild
-        buyer_count, seller_count = await STORE.active_counts(guild.id) if guild else (0, 0)
-        await interaction.response.send_message(
-            f"📤 **Sell an NFT**\n\n🟢 **{buyer_count} active buyers currently.**\n\nClick **Continue** to list your NFT.",
-            view=TradeChoiceView("sell", guild.id if guild else 0),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="My Matches", emoji="🎯", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:matches", row=2)
-    async def my_matches(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        await matches.callback(interaction)
-
-    @discord.ui.button(label="My Requests", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:requests", row=2)
-    async def my_requests(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        await send_my_requests(interaction)
-
-    @discord.ui.button(label="Cancel a Request", emoji="❌", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:cancel", row=3)
-    async def cancel_request(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        await interaction.response.send_message(
-            "Which request do you want to cancel?",
-            view=CancelChoiceView(),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="How It Works", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:help", row=3)
-    async def how_it_works(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await send_help(interaction)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
-        logger.exception("NFT Market menu button error", exc_info=error)
-        message = "An error occurred. Please try again in a moment."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-        
 class NFTMarketBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -1060,12 +930,12 @@ class NFTMarketBot(commands.Bot):
 
                 granted.append(guild.name)
                 logger.info(
-                    "Granted verified NFT Market access to user=%s in guild=%s",
+                    "Granted verified NFT Market access to user=%s in guild=%s.",
                     association.discord_user_id, guild.id
                 )
             except (discord.Forbidden, discord.HTTPException):
                 logger.warning(
-                    "Could not grant verified access for user=%s in guild=%s",
+                    "Could not grant verified access for user=%s in guild=%s.",
                     association.discord_user_id, guild.id, exc_info=True
                 )
 
@@ -1090,8 +960,7 @@ class NFTMarketBot(commands.Bot):
                 f"Public address: `{short_public_key(association.public_key)}`\n"
                 f"Verified at: {association.verified_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
                 "This confirms control of the Solana address only. It does not verify ownership of an NFT Pass."
-                + access_text,
-                view=MainMenuView(),
+                + access_text
             )
         except (discord.Forbidden, discord.HTTPException, Exception):
             logger.warning(
@@ -1349,7 +1218,6 @@ class NFTMarketBot(commands.Bot):
             ),
             None,
         )
-
         if category is None:
             logger.info(
                 "Creating private market category '%s' in guild=%s.",
@@ -1696,72 +1564,363 @@ async def send_wallet_verification_link(interaction: discord.Interaction) -> Non
             "Wallet session creation failed for user=%s", interaction.user.id
         )
         await interaction.followup.send(
-            "Could not start wallet verification right now. Please try again.",
+            content="⚠️ Wallet verification is temporarily unavailable. "
+            "Please try again in a moment.",
             ephemeral=True,
         )
         return
 
-    if not url:
-        await interaction.followup.send(
-            "Wallet verification is not configured on the bot server yet. Please contact an administrator.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.followup.send(
-        "🔐 **Verify Solana Wallet**\n"
-        "Click the button below to connect your Solana wallet (Phantom, etc.) "
-        "and sign a cryptographic proof of ownership.\n\n"
-        "Never enter your seed phrase, private key, or wallet password.\n"
-        "Link expires in 5 minutes.",
-        view=WalletVerifyView(url),
-        ephemeral=True,
+    logger.info(
+        "Created verification session %s for user=%s; URL=%s",
+        session.token[:8],
+        interaction.user.id,
+        url,
     )
+    if url is None:
+        await interaction.followup.send(
+            content="⚠️ The verification server URL is not configured. "
+            "Please check WALLET_VERIFY_BASE_URL or APP_URL in your environment.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🔐 Verify Solana Wallet",
+        description=(
+            "Click the button below to connect your Solana wallet (Phantom, etc.) "
+            "and sign a cryptographic proof of ownership.\n\n"
+            "⚠️ **Safety Notice:** NFT Market will **NEVER** ask for your seed phrase, "
+            "private key, or wallet password. Only message signature is requested."
+        ),
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text="Link expires in 5 minutes.")
+    view = WalletVerifyView(url)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="wallet-status", description="Show your verified Solana wallet status.")
+@bot.tree.command(name="wallet-status", description="Check if your Solana wallet is verified.")
 async def wallet_status(interaction: discord.Interaction) -> None:
+    """Display verification status for the calling user."""
+    await send_wallet_status(interaction)
+
+
+async def send_wallet_status(interaction: discord.Interaction) -> None:
+    """Shared by /wallet-status and the 👛 My Wallet button."""
     association = await WALLET_STORE.get_association(interaction.user.id)
     if association is None:
-        await interaction.response.send_message(
-            "No Solana wallet is currently verified for your Discord account.",
-            ephemeral=True,
+        message = (
+            "❌ **Wallet verified:** No\n"
+            "Use `/wallet` or 🔐 **Verify Wallet** to connect and verify your Solana address."
         )
-        return
+    else:
+        message = (
+            "✅ **Wallet verified:** Yes\n"
+            f"**Public address:** `{short_public_key(association.public_key)}`\n"
+            f"**Verified at:** {association.verified_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            "ℹ️ *This status only proves control of the Solana address.*"
+        )
 
-    await interaction.response.send_message(
-        "✅ **Wallet verified**\n"
-        f"Public address: `{short_public_key(association.public_key)}`\n"
-        f"Verified at: {association.verified_at.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        "This confirms control of the Solana address only. It does not verify ownership of an NFT Pass.",
-        ephemeral=True,
-    )
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
-@bot.tree.command(name="wallet-remove", description="Remove your verified Solana wallet association.")
+@bot.tree.command(name="wallet-remove", description="Unlink your verified Solana wallet from your Discord account.")
 async def wallet_remove(interaction: discord.Interaction) -> None:
+    """Remove wallet association for the calling user."""
     association = await WALLET_STORE.remove_association(interaction.user.id)
     if association is None:
         await interaction.response.send_message(
-            "No verified wallet is associated with your Discord account.",
+            "You do not have any verified wallet associated with your Discord account.",
             ephemeral=True,
         )
         return
 
     await interaction.response.send_message(
-        "Wallet association removed. You must verify a wallet again before using the private NFT Market.",
+        f"🗑️ The wallet `{short_public_key(association.public_key)}` has been unlinked from your account.",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="help", description="Explain the NFT Market Bot commands.")
+async def help_command(interaction: discord.Interaction) -> None:
+    await send_help(interaction)
+
+
+async def send_help(interaction: discord.Interaction) -> None:
+    """Shared by /help and the ℹ️ How It Works button."""
+    embed = discord.Embed(
+        title="NFT Market Bot",
+        description="A private buyer/seller matching and Solana verified network.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="/sell", value="Register an NFT you want to sell.", inline=False)
+    embed.add_field(name="/buy", value="Register an NFT you want to buy.", inline=False)
+    embed.add_field(name="/matches", value="View your current matches privately.", inline=False)
+    embed.add_field(name="/cancel", value="Cancel an active buy or sell request.", inline=False)
+    embed.add_field(name="/wallet", value="Connect and cryptographically verify your Solana wallet.", inline=False)
+    embed.add_field(name="/wallet-status", value="Check if your wallet is verified.", inline=False)
+    embed.add_field(name="/wallet-remove", value="Unlink your wallet from your account.", inline=False)
+    embed.add_field(name="/ping", value="Check the bot latency.", inline=False)
+    embed.set_footer(text="Cryptographic Ed25519 signatures verify address control without sharing private keys.")
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="ping", description="Return the bot latency.")
+async def ping(interaction: discord.Interaction) -> None:
+    latency_ms = round(bot.latency * 1000)
+    logger.info("Pong answered for user=%s: %d ms", interaction.user.id, latency_ms)
+    await interaction.response.send_message(
+        f"Pong! Latency: **{latency_ms} ms**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="menu", description="Post the NFT Market button menu in this channel.")
+@app_commands.guild_only()
+async def menu(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    buyer_count, seller_count = await STORE.active_counts(guild.id) if guild else (0, 0)
+    embed = discord.Embed(
+        title="🖼️ NFT Market",
+        description=(
+            "Buy, sell, and find matching counterparties in the private market.\n\n"
+            f"🟢 **Active Buyers: {buyer_count}**\n"
+            f"🔴 **Active Sellers: {seller_count}**\n\n"
+            "The counters represent users who currently have an active request."
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, view=MainMenuView())
+
+
+async def send_my_requests(interaction: discord.Interaction) -> None:
+    """Shared handler for the 📋 My Requests button."""
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This can only be used inside a Discord server.", ephemeral=True
+        )
+        return
+
+    listings = await STORE.active_requests_for_user(guild.id, interaction.user.id)
+    if not listings:
+        await interaction.response.send_message(
+            "You have no active requests. Use 🟢 I Want to Buy or 🔴 I Want to Sell.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(title="📋 Your Active Requests", color=discord.Color.blurple())
+    for listing in listings[:10]:
+        embed.add_field(
+            name=f"{listing.kind.upper()} · {listing.collection}",
+            value=f"{format_amount(listing.amount, listing.currency)} · ID {listing.listing_id}",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class CancelChoiceView(discord.ui.View):
+    """Small ephemeral menu so the ❌ Annuler button can pick buy/sell/both."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=120)
+
+    async def _cancel(self, interaction: discord.Interaction, request_type: str, label: str) -> None:
+        cancelled = await STORE.cancel_latest(interaction.user.id, request_type)
+        if not cancelled:
+            await interaction.response.edit_message(
+                content=f"You have no active **{label}** request to cancel.",
+                view=None,
+            )
+            return
+        names = ", ".join(f"{item.kind} for {item.collection}" for item in cancelled)
+        await interaction.response.edit_message(content=f"Cancelled: **{names}**.", view=None)
+
+    @discord.ui.button(label="Buy", style=discord.ButtonStyle.secondary, custom_id="nftmarket:cancel:buy")
+    async def cancel_buy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._cancel(interaction, "buy", "buy")
+
+    @discord.ui.button(label="Sell", style=discord.ButtonStyle.secondary, custom_id="nftmarket:cancel:sell")
+    async def cancel_sell(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._cancel(interaction, "sell", "sell")
+
+    @discord.ui.button(label="Both", style=discord.ButtonStyle.danger, custom_id="nftmarket:cancel:both")
+    async def cancel_both(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._cancel(interaction, "both", "buy/sell")
+
+
+class TradeChoiceView(discord.ui.View):
+    """Shows the live opposite-side count before opening the trade form."""
+    def __init__(self, mode: str, guild_id: int) -> None:
+        super().__init__(timeout=120)
+        self.mode = mode
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.success, custom_id="nftmarket:trade:continue")
+    async def continue_trade(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_verified_wallet(interaction):
+            return
+        await interaction.response.send_modal(BuyModal() if self.mode == "buy" else SellModal())
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, custom_id="nftmarket:trade:refresh")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        buyer_count, seller_count = await STORE.active_counts(self.guild_id)
+        if self.mode == "buy":
+            content = f"🔎 **Buy an NFT**\n\n🔴 **{seller_count} active sellers currently.**\n\nClick **Continue** to create your request."
+        else:
+            content = f"📤 **Sell an NFT**\n\n🟢 **{buyer_count} active buyers currently.**\n\nClick **Continue** to list your NFT."
+        await interaction.response.edit_message(content=content, view=self)
+
+
+class MainMenuView(discord.ui.View):
+    """Persistent NFT Market button menu."""
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Verify Wallet", emoji="🔐", style=discord.ButtonStyle.primary, custom_id="nftmarket:menu:verify_wallet", row=0)
+    async def verify_wallet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await send_wallet_verification_link(interaction)
+
+    @discord.ui.button(label="My Wallet", emoji="👛", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:my_wallet", row=0)
+    async def my_wallet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await send_wallet_status(interaction)
+
+    @discord.ui.button(label="I Want to Buy", emoji="🟢", style=discord.ButtonStyle.success, custom_id="nftmarket:menu:buy", row=1)
+    async def want_buy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_verified_wallet(interaction):
+            return
+        guild = interaction.guild
+        buyer_count, seller_count = await STORE.active_counts(guild.id) if guild else (0, 0)
+        await interaction.response.send_message(
+            f"🔎 **Buy an NFT**\n\n🔴 **{seller_count} active sellers currently.**\n\nClick **Continue** to create your request.",
+            view=TradeChoiceView("buy", guild.id if guild else 0), ephemeral=True
+        )
+
+    @discord.ui.button(label="I Want to Sell", emoji="🔴", style=discord.ButtonStyle.danger, custom_id="nftmarket:menu:sell", row=1)
+    async def want_sell(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_verified_wallet(interaction):
+            return
+        guild = interaction.guild
+        buyer_count, seller_count = await STORE.active_counts(guild.id) if guild else (0, 0)
+        await interaction.response.send_message(
+            f"📤 **Sell an NFT**\n\n🟢 **{buyer_count} active buyers currently.**\n\nClick **Continue** to list your NFT.",
+            view=TradeChoiceView("sell", guild.id if guild else 0), ephemeral=True
+        )
+
+    @discord.ui.button(label="My Matches", emoji="🎯", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:matches", row=2)
+    async def my_matches(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_verified_wallet(interaction):
+            return
+        await matches.callback(interaction)
+
+    @discord.ui.button(label="My Requests", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:requests", row=2)
+    async def my_requests(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_verified_wallet(interaction):
+            return
+        await send_my_requests(interaction)
+
+    @discord.ui.button(label="Cancel a Request", emoji="❌", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:cancel", row=3)
+    async def cancel_request(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_verified_wallet(interaction):
+            return
+        await interaction.response.send_message("Which request do you want to cancel?", view=CancelChoiceView(), ephemeral=True)
+
+    @discord.ui.button(label="How It Works", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:help", row=3)
+    async def how_it_works(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await send_help(interaction)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        logger.exception("NFT Market menu button error", exc_info=error)
+        message = "An error occurred. Please try again in a moment."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    original = getattr(error, "original", error)
+    if isinstance(original, discord.Forbidden):
+        message = (
+            "Discord denied that action. Please check that the bot can manage "
+            "channels and send messages."
+        )
+    elif isinstance(original, discord.HTTPException):
+        message = "Discord could not complete that action. Please try again in a moment."
+    else:
+        logger.exception("Unhandled slash command error", exc_info=original)
+        message = "Something went wrong while processing that command."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.event
 async def on_ready() -> None:
-    logger.info("Connected to Discord as %s (ID: %s).", bot.user, bot.user.id if bot.user else "unknown")
-    logger.info("NFT Market Bot is ready.")
+    if not bot.ready_message_sent:
+        bot.ready_message_sent = True
+        bot.add_view(MainMenuView())
+        logger.info("Connected to Discord as %s (ID: %s).", bot.user, bot.user.id if bot.user else "unknown")
+        for guild in bot.guilds:
+            if guild.me is None:
+                logger.error(
+                    "Bot member is unavailable in guild=%s (%s); private deal "
+                    "channels cannot be created there.",
+                    guild.id,
+                    guild.name,
+                )
+                continue
+            permissions = guild.me.guild_permissions
+            missing = [
+                name
+                for name, granted in {
+                    "View Channel": permissions.view_channel,
+                    "Send Messages": permissions.send_messages,
+                    "Embed Links": permissions.embed_links,
+                    "Read Message History": permissions.read_message_history,
+                    "Manage Channels": permissions.manage_channels,
+                    "Manage Roles": permissions.manage_roles,
+                }.items()
+                if not granted
+            ]
+            if missing:
+                logger.error(
+                    "Private deal channel permissions missing in guild=%s (%s): %s.",
+                    guild.id,
+                    guild.name,
+                    ", ".join(missing),
+                )
+            else:
+                logger.info(
+                    "Private deal channel permissions verified in guild=%s (%s).",
+                    guild.id,
+                    guild.name,
+                )
+        logger.info("NFT Market Bot is ready.")
+
+
+def main() -> None:
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        print(
+            "DISCORD_TOKEN is not set. Add it to your environment secrets, then run the bot again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    bot.run(token, log_handler=None)
 
 
 if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN is not configured.")
-    bot.run(token)
+    main()
