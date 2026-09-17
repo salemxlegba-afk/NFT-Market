@@ -790,6 +790,60 @@ async def report_modal_error(
     else:
         await interaction.response.send_message(message, ephemeral=True)
 
+class TradeChoiceView(discord.ui.View):
+    """Shows the live opposite-side count before opening the trade form."""
+
+    def __init__(self, mode: str, guild_id: int) -> None:
+        super().__init__(timeout=120)
+        self.mode = mode
+        self.guild_id = guild_id
+
+    @discord.ui.button(
+        label="Continue",
+        style=discord.ButtonStyle.success,
+        custom_id="nftmarket:trade:continue",
+    )
+    async def continue_trade(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if not await require_verified_wallet(interaction):
+            return
+        await interaction.response.send_modal(
+            BuyModal() if self.mode == "buy" else SellModal()
+        )
+
+    @discord.ui.button(
+        label="Refresh",
+        style=discord.ButtonStyle.secondary,
+        custom_id="nftmarket:trade:refresh",
+    )
+    async def refresh(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        buyer_count, seller_count = await STORE.active_counts(self.guild_id)
+
+        if self.mode == "buy":
+            content = (
+                f"🔎 **Buy an NFT**\n\n"
+                f"🔴 **{seller_count} active sellers currently.**\n\n"
+                "Click **Continue** to create your request."
+            )
+        else:
+            content = (
+                f"📤 **Sell an NFT**\n\n"
+                f"🟢 **{buyer_count} active buyers currently.**\n\n"
+                "Click **Continue** to list your NFT."
+            )
+
+        await interaction.response.edit_message(
+            content=content,
+            view=self,
+        )
+
 class MainMenuView(discord.ui.View):
     """Persistent NFT Market button menu."""
 
