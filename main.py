@@ -1409,21 +1409,39 @@ class NFTMarketBot(commands.Bot):
 
 
 class DealActionView(discord.ui.View):
-    def __init__(self, match_id: str) -> None:
+    def __init__(self, match_id: Optional[str] = None) -> None:
         super().__init__(timeout=None)
         self.match_id = match_id
+
+    async def _get_match_id(self, interaction: discord.Interaction) -> Optional[str]:
+        if self.match_id is not None:
+            return self.match_id
+        channel_id = getattr(interaction.channel, "id", None)
+        if channel_id is None:
+            return None
+        matches = await STORE.matches_for_user(interaction.user.id)
+        match = next((item for item in matches if item.channel_id == channel_id), None)
+        return match.match_id if match is not None else None
 
     @discord.ui.button(label="Complete Deal", emoji="✅", style=discord.ButtonStyle.success, custom_id="nftmarket:deal:complete")
     async def complete(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         bot = interaction.client
         if isinstance(bot, NFTMarketBot):
-            await bot.change_deal_status(interaction, self.match_id, "COMPLETED")
+            match_id = await self._get_match_id(interaction)
+            if match_id is None:
+                await interaction.response.send_message("This deal could not be found.", ephemeral=True)
+                return
+            await bot.change_deal_status(interaction, match_id, "COMPLETED")
 
     @discord.ui.button(label="Cancel Deal", emoji="❌", style=discord.ButtonStyle.danger, custom_id="nftmarket:deal:cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         bot = interaction.client
         if isinstance(bot, NFTMarketBot):
-            await bot.change_deal_status(interaction, self.match_id, "CANCELLED")
+            match_id = await self._get_match_id(interaction)
+            if match_id is None:
+                await interaction.response.send_message("This deal could not be found.", ephemeral=True)
+                return
+            await bot.change_deal_status(interaction, match_id, "CANCELLED")
 
 
 bot = NFTMarketBot()
@@ -1897,6 +1915,7 @@ async def on_ready() -> None:
     if not bot.ready_message_sent:
         bot.ready_message_sent = True
         bot.add_view(MainMenuView())
+        bot.add_view(DealActionView())
         logger.info("Connected to Discord as %s (ID: %s).", bot.user, bot.user.id if bot.user else "unknown")
         for guild in bot.guilds:
             if guild.me is None:
