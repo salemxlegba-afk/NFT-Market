@@ -1822,6 +1822,26 @@ class TradeChoiceView(discord.ui.View):
         await interaction.response.edit_message(content=content, view=self)
 
 
+async def send_access_offers(interaction: discord.Interaction) -> None:
+    """Show the available paid access durations."""
+    embed = discord.Embed(
+        title="💳 Choose Your Access",
+        description=(
+            "**Choose the offer that suits you:**\n\n"
+            "⚡ **24H Access — $8**\n"
+            "Your access remains active for 24 hours. During this time, "
+            "the system continuously searches for potential buyers or sellers matching your request.\n\n"
+            "🔥 **48H Access — $15**\n"
+            "Your access remains active for 48 hours, giving the system more time "
+            "to search for a potential match.\n\n"
+            "💡 **More time = more opportunities to find a match.**\n\n"
+            "⚠️ **Important:** A match is not guaranteed during the selected access period."
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class MainMenuView(discord.ui.View):
     """Persistent NFT Market button menu."""
     def __init__(self) -> None:
@@ -1874,6 +1894,10 @@ class MainMenuView(discord.ui.View):
         if not await require_verified_wallet(interaction):
             return
         await interaction.response.send_message("Which request do you want to cancel?", view=CancelChoiceView(), ephemeral=True)
+
+    @discord.ui.button(label="Get Access", emoji="💳", style=discord.ButtonStyle.primary, custom_id="nftmarket:menu:access", row=4)
+    async def get_access(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await send_access_offers(interaction)
 
     @discord.ui.button(label="How It Works", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:help", row=3)
     async def how_it_works(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
