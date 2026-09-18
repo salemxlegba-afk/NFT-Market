@@ -27,3 +27,4 @@ def _bot_init(self, *args, **kwargs):
 commands.Bot.__init__ = _bot_init
 
 import payment_extension  # noqa: E402,F401
+import payment_ui_patch  # noqa: E402,F401
