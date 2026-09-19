@@ -10,20 +10,6 @@ from discord.ext import commands
 
 from supabase_store import SupabaseClient
 
-# discord.py compatibility: some deployed versions expose PartialMessage.delete()
-# without the optional reason keyword used by the bot cleanup code.
-try:
-    from discord.message import PartialMessage
-
-    _original_partial_message_delete = PartialMessage.delete
-
-    async def _partial_message_delete_compat(self, *, reason=None):
-        return await _original_partial_message_delete(self)
-
-    PartialMessage.delete = _partial_message_delete_compat
-except (ImportError, AttributeError):
-    pass
-
 
 _original_bot_init = commands.Bot.__init__
 
