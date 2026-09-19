@@ -1475,6 +1475,52 @@ class DealActionView(discord.ui.View):
 bot = NFTMarketBot()
 
 
+async def require_paid_access(interaction: discord.Interaction) -> bool:
+    """Require an active paid access period before creating a market request."""
+    client = getattr(interaction.client, "paid_access_client", None)
+    if client is None:
+        message = "⚠️ Paid access is temporarily unavailable. Please try again shortly."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return False
+
+    try:
+        rows = await client.get(
+            "paid_access",
+            params={
+                "discord_user_id": f"eq.{interaction.user.id}",
+                "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
+                "order": "expires_at.desc",
+                "limit": "1",
+            },
+        )
+    except Exception:
+        logger.exception("Could not check paid access for user=%s.", interaction.user.id)
+        message = "⚠️ I could not verify your paid access right now. Please try again."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return False
+
+    if rows:
+        return True
+
+    message = (
+        "💳 **Paid access required.**\n\n"
+        "Your wallet is verified, but you need an active 24H or 48H access period "
+        "to create a buy or sell request.\n\n"
+        "Click **Get Access** in the NFT Market menu to continue."
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    return False
+
+
 async def require_verified_wallet(interaction: discord.Interaction) -> bool:
     association = await WALLET_STORE.get_association(interaction.user.id)
     if association is not None:
@@ -1509,6 +1555,8 @@ async def require_verified_wallet(interaction: discord.Interaction) -> bool:
 async def sell(interaction: discord.Interaction) -> None:
     if not await require_verified_wallet(interaction):
         return
+    if not await require_paid_access(interaction):
+        return
     await interaction.response.send_modal(SellModal())
 
 
@@ -1516,6 +1564,8 @@ async def sell(interaction: discord.Interaction) -> None:
 @app_commands.guild_only()
 async def buy(interaction: discord.Interaction) -> None:
     if not await require_verified_wallet(interaction):
+        return
+    if not await require_paid_access(interaction):
         return
     await interaction.response.send_modal(BuyModal())
 
@@ -1846,6 +1896,8 @@ class TradeChoiceView(discord.ui.View):
     @discord.ui.button(label="Continue", style=discord.ButtonStyle.success, custom_id="nftmarket:trade:continue")
     async def continue_trade(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await require_verified_wallet(interaction):
+            return
+        if not await require_paid_access(interaction):
             return
         await interaction.response.send_modal(BuyModal() if self.mode == "buy" else SellModal())
 
