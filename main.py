@@ -1018,9 +1018,9 @@ class NFTMarketBot(commands.Bot):
             )
             return
 
-        await self.complete_match(guild, match)
         await interaction.followup.send(
-            self.match_summary(match, "seller"),
+            self.locked_match_summary(match, "seller"),
+            view=MatchUnlockView(match.match_id),
             ephemeral=True,
         )
 
@@ -1072,9 +1072,9 @@ class NFTMarketBot(commands.Bot):
             )
             return
 
-        await self.complete_match(guild, match)
         await interaction.followup.send(
-            self.match_summary(match, "buyer"),
+            self.locked_match_summary(match, "buyer"),
+            view=MatchUnlockView(match.match_id),
             ephemeral=True,
         )
 
@@ -1092,6 +1092,15 @@ class NFTMarketBot(commands.Bot):
             f"Match found with **{other_person}** for **{match.seller.collection}**. "
             f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**."
             f"{channel_text}"
+        )
+
+    @staticmethod
+    def locked_match_summary(match: Match, role: str) -> str:
+        return (
+            f"🎯 **Match found** for **{match.seller.collection}**.\n\n"
+            f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**\n"
+            "🔒 Counterparty identity and private contact are hidden for now.\n\n"
+            "Searching was free. Click **👀 View / Contact** if you want to unlock this match."
         )
 
     async def complete_match(self, guild: discord.Guild, match: Match) -> None:
@@ -1441,180 +1450,7 @@ class DealActionView(discord.ui.View):
             await bot.change_deal_status(interaction, match_id, "COMPLETED")
 
     @discord.ui.button(label="Cancel Deal", emoji="❌", style=discord.ButtonStyle.danger, custom_id="nftmarket:deal:cancel")
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        bot = interaction.client
-        if isinstance(bot, NFTMarketBot):
-            match_id = await self._get_match_id(interaction)
-            if match_id is None:
-                await interaction.response.send_message("This deal could not be found.", ephemeral=True)
-                return
-            await bot.change_deal_status(interaction, match_id, "CANCELLED")
-
-
-bot = NFTMarketBot()
-
-
-async def require_paid_access(interaction: discord.Interaction) -> bool:
-    """Require an active paid access period before creating a market request."""
-    client = getattr(interaction.client, "paid_access_client", None)
-    if client is None:
-        message = "⚠️ Paid access is temporarily unavailable. Please try again shortly."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-        return False
-
-    try:
-        rows = await client.get(
-            "paid_access",
-            params={
-                "discord_user_id": f"eq.{interaction.user.id}",
-                "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
-                "order": "expires_at.desc",
-                "limit": "1",
-            },
-        )
-    except Exception:
-        logger.exception("Could not check paid access for user=%s.", interaction.user.id)
-        message = "⚠️ I could not verify your paid access right now. Please try again."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-        return False
-
-    if rows:
-        return True
-
-    message = (
-        "💳 **Paid access required.**\n\n"
-        "Your wallet is verified, but you need an active 24H or 48H access period "
-        "to create a buy or sell request.\n\n"
-        "Click **Get Access** in the NFT Market menu to continue."
-    )
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
-    return False
-
-
-async def require_verified_wallet(interaction: discord.Interaction) -> bool:
-    association = await WALLET_STORE.get_association(interaction.user.id)
-    if association is not None:
-        return True
-
-    message = (
-        "🔐 **Wallet verification required.**\n"
-        "You must verify your Solana wallet before using the private NFT Market.\n\n"
-        "Click **Verify My Wallet** below to connect your wallet and sign the verification message."
-    )
-
-    view = WalletVerifyPromptView()
-
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            view=view,
-            ephemeral=True,
-        )
-    else:
-        await interaction.response.send_message(
-            message,
-            view=view,
-            ephemeral=True,
-        )
-
-    return False
-
-
-@bot.tree.command(name="sell", description="Register an NFT you want to sell.")
-@app_commands.guild_only()
-async def sell(interaction: discord.Interaction) -> None:
-    if not await require_verified_wallet(interaction):
-        return
-    if not await require_paid_access(interaction):
-        return
-    await interaction.response.send_modal(SellModal())
-
-
-@bot.tree.command(name="buy", description="Register an NFT you want to buy.")
-@app_commands.guild_only()
-async def buy(interaction: discord.Interaction) -> None:
-    if not await require_verified_wallet(interaction):
-        return
-    if not await require_paid_access(interaction):
-        return
-    await interaction.response.send_modal(BuyModal())
-
-
-@bot.tree.command(name="matches", description="Show your current private matches.")
-@app_commands.guild_only()
-async def matches(interaction: discord.Interaction) -> None:
-    if not await require_verified_wallet(interaction):
-        return
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message(
-            "This command can only be used inside a Discord server.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    new_matches = await STORE.reconcile(guild.id)
-    for match in new_matches:
-        await bot.complete_match(guild, match)
-
-    user_matches = await STORE.matches_for_user(interaction.user.id)
-    if not user_matches:
-        await interaction.followup.send(
-            "You do not have any matches yet.",
-            ephemeral=True,
-        )
-        return
-
-    embed = discord.Embed(
-        title="Your NFT Market matches",
-        description="Only you can see this response.",
-        color=discord.Color.blurple(),
-    )
-    for match in user_matches[-10:]:
-        other_person = (
-            match.seller.user_name
-            if match.buyer.user_id == interaction.user.id
-            else match.buyer.user_name
-        )
-        channel_text = match.channel_name or f"deal-{match.match_id}"
-        embed.add_field(
-            name=f"{match.seller.collection} · {match.match_id}",
-            value=(
-                f"Other party: **{other_person}**\n"
-                f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**\n"
-                f"Status: **{getattr(match, 'status', 'MATCHED')}**\n"
-                f"Deal channel: {channel_text}"
-            ),
-            inline=False,
-        )
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="cancel", description="Cancel an active buy or sell request.")
-@app_commands.guild_only()
-@app_commands.describe(request_type="Which active request should be cancelled?")
-@app_commands.choices(
-    request_type=[
-        app_commands.Choice(name="Buy request", value="buy"),
-        app_commands.Choice(name="Sell request", value="sell"),
-        app_commands.Choice(name="Both", value="both"),
-    ]
-)
-async def cancel(
-    interaction: discord.Interaction, request_type: app_commands.Choice[str]
-) -> None:
-    if not await require_verified_wallet(interaction):
-        return
+    async def cancel(interaction: discord.Interaction, request_type: app_commands.Choice[str]) -> None:
     cancelled = await STORE.cancel_latest(interaction.user.id, request_type.value)
     if not cancelled:
         await interaction.response.send_message(
@@ -1753,7 +1589,7 @@ async def send_help(interaction: discord.Interaction) -> None:
     """Shared by /help and the ℹ️ How It Works button."""
     embed = discord.Embed(
         title="NFT Market Bot",
-        description="A private buyer/seller matching and Solana verified network.",
+        description="QuickSell finds a compatible buyer or seller first. Searching is free; payment is requested only to unlock a real match.",
         color=discord.Color.blurple(),
     )
     embed.add_field(name="/sell", value="Register an NFT you want to sell.", inline=False)
@@ -1874,11 +1710,10 @@ class TradeChoiceView(discord.ui.View):
 
     @discord.ui.button(label="Continue", style=discord.ButtonStyle.success, custom_id="nftmarket:trade:continue")
     async def continue_trade(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        if not await require_paid_access(interaction):
-            return
-        await interaction.response.send_modal(BuyModal() if self.mode == "buy" else SellModal())
+        await interaction.response.send_modal(
+            BuyModal() if self.mode == "buy" else SellModal()
+        )
+
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, custom_id="nftmarket:trade:refresh")
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1915,12 +1750,32 @@ async def cleanup_old_market_menus(
     keep_message_id: Optional[int] = None,
     limit: Optional[int] = 200,
 ) -> int:
-    """Deletion is disabled: never remove NFT Market menu messages."""
+    """Delete stale NFT Market public menus so old buttons cannot remain visible."""
+    deleted = 0
+    try:
+        async for message in channel.history(limit=limit):
+            if keep_message_id is not None and message.id == keep_message_id:
+                continue
+            if await _is_nft_market_menu(message):
+                try:
+                    await message.delete(reason="Replace old NFT Market menu with QuickSell menu")
+                    deleted += 1
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    logger.warning(
+                        "Could not delete old NFT Market menu message=%s.",
+                        message.id,
+                    )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning(
+            "Could not inspect old NFT Market menus in #%s.",
+            getattr(channel, "name", "unknown"),
+        )
     logger.info(
-        "NFT Market menu deletion disabled in #%s; no messages deleted.",
+        "QuickSell menu cleanup in #%s: deleted=%d",
         getattr(channel, "name", "unknown"),
+        deleted,
     )
-    return 0
+    return deleted
 
 
 async def refresh_market_menu(channel: discord.TextChannel) -> None:
@@ -1975,69 +1830,182 @@ async def send_access_offers(interaction: discord.Interaction) -> None:
     )
 
 
+class MatchUnlockView(discord.ui.View):
+    """Show the pass only after a real compatible match has been found."""
+
+    def __init__(self, match_id: str) -> None:
+        super().__init__(timeout=10 * 60)
+        self.match_id = match_id
+
+    @discord.ui.button(
+        label="View / Contact",
+        emoji="👀",
+        style=discord.ButtonStyle.success,
+        custom_id="nftmarket:match:view",
+    )
+    async def view_contact(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        matches_for_user = await STORE.matches_for_user(interaction.user.id)
+        match = next(
+            (m for m in matches_for_user if m.match_id == self.match_id),
+            None,
+        )
+        if match is None or getattr(match, "status", "MATCHED") != "MATCHED":
+            await interaction.response.send_message(
+                "This match is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        # No payment is requested before a match. This is the first point where
+        # the user is asked to choose a paid access period.
+        if not await require_paid_access(interaction):
+            await send_match_access_offers(interaction, self.match_id)
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This can only be used inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await bot.complete_match(guild, match)
+        other = (
+            match.seller.user_name
+            if match.buyer.user_id == interaction.user.id
+            else match.buyer.user_name
+        )
+        await interaction.followup.send(
+            f"✅ **Match unlocked.**\n\n"
+            f"Counterparty: **{other}**\n"
+            f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**\n"
+            f"Private channel: {match.channel_name or 'being created...'}",
+            ephemeral=True,
+        )
+
+
+async def send_match_access_offers(
+    interaction: discord.Interaction, match_id: str
+) -> None:
+    """Show 24H/48H payment options only after a real match exists."""
+    embed = discord.Embed(
+        title="🔒 Unlock this match",
+        description=(
+            "A compatible trader has been found.\n\n"
+            "You do **not** pay to search. You only pay now if you want to "
+            "see the counterparty and contact them.\n\n"
+            "🕐 **24H** — $8\n"
+            "🚀 **48H** — $15\n\n"
+            "Your access starts only after the payment is confirmed."
+        ),
+        color=discord.Color.gold(),
+    )
+    await interaction.followup.send(
+        embed=embed,
+        view=AccessPlanView(),
+        ephemeral=True,
+    )
+
+
 class MainMenuView(discord.ui.View):
-    """Persistent NFT Market button menu."""
+    """Persistent QuickSell menu: search is free; payment appears only after a match."""
+
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Verify Wallet", emoji="🔐", style=discord.ButtonStyle.primary, custom_id="nftmarket:menu:verify_wallet", row=0)
-    async def verify_wallet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await send_wallet_verification_link(interaction)
-
-    @discord.ui.button(label="My Wallet", emoji="👛", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:my_wallet", row=0)
-    async def my_wallet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await send_wallet_status(interaction)
-
-    @discord.ui.button(label="I Want to Buy", emoji="🟢", style=discord.ButtonStyle.success, custom_id="nftmarket:menu:buy", row=1)
+    @discord.ui.button(
+        label="I Want to Buy",
+        emoji="🛒",
+        style=discord.ButtonStyle.success,
+        custom_id="nftmarket:menu:buy",
+        row=0,
+    )
     async def want_buy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
         guild = interaction.guild
         buyer_count, seller_count = await STORE.active_counts(guild.id) if guild else (0, 0)
         await interaction.response.send_message(
-            f"🔎 **Buy an NFT**\n\n🔴 **{seller_count} active sellers currently.**\n\nClick **Continue** to create your request.",
-            view=TradeChoiceView("buy", guild.id if guild else 0), ephemeral=True
+            f"🛒 **I Want to Buy**\n\n"
+            f"🔴 **{seller_count} active sellers currently.**\n\n"
+            "Start your search for free. You will only be asked to choose a pass "
+            "if a real match is found.",
+            view=TradeChoiceView("buy", guild.id if guild else 0),
+            ephemeral=True,
         )
 
-    @discord.ui.button(label="I Want to Sell", emoji="🔴", style=discord.ButtonStyle.danger, custom_id="nftmarket:menu:sell", row=1)
+    @discord.ui.button(
+        label="I Want to Sell",
+        emoji="💰",
+        style=discord.ButtonStyle.primary,
+        custom_id="nftmarket:menu:sell",
+        row=0,
+    )
     async def want_sell(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
         guild = interaction.guild
         buyer_count, seller_count = await STORE.active_counts(guild.id) if guild else (0, 0)
         await interaction.response.send_message(
-            f"📤 **Sell an NFT**\n\n🟢 **{buyer_count} active buyers currently.**\n\nClick **Continue** to list your NFT.",
-            view=TradeChoiceView("sell", guild.id if guild else 0), ephemeral=True
+            f"💰 **I Want to Sell**\n\n"
+            f"🟢 **{buyer_count} active buyers currently.**\n\n"
+            "Start your search for free. You will only be asked to choose a pass "
+            "if a real match is found.",
+            view=TradeChoiceView("sell", guild.id if guild else 0),
+            ephemeral=True,
         )
 
-    @discord.ui.button(label="My Matches", emoji="🎯", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:matches", row=2)
+    @discord.ui.button(
+        label="My Matches",
+        emoji="🎯",
+        style=discord.ButtonStyle.secondary,
+        custom_id="nftmarket:menu:matches",
+        row=1,
+    )
     async def my_matches(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
         await matches.callback(interaction)
 
-    @discord.ui.button(label="My Requests", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:requests", row=2)
+    @discord.ui.button(
+        label="My Requests",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="nftmarket:menu:requests",
+        row=1,
+    )
     async def my_requests(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
         await send_my_requests(interaction)
 
-    @discord.ui.button(label="Cancel a Request", emoji="❌", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:cancel", row=3)
+    @discord.ui.button(
+        label="Cancel Request",
+        emoji="❌",
+        style=discord.ButtonStyle.secondary,
+        custom_id="nftmarket:menu:cancel",
+        row=2,
+    )
     async def cancel_request(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await require_verified_wallet(interaction):
-            return
-        await interaction.response.send_message("Which request do you want to cancel?", view=CancelChoiceView(), ephemeral=True)
+        await interaction.response.send_message(
+            "Which request do you want to cancel?",
+            view=CancelChoiceView(),
+            ephemeral=True,
+        )
 
-    @discord.ui.button(label="Get Access", emoji="💳", style=discord.ButtonStyle.primary, custom_id="nftmarket:menu:access", row=4)
-    async def get_access(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await send_access_offers(interaction)
-
-    @discord.ui.button(label="How It Works", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="nftmarket:menu:help", row=3)
+    @discord.ui.button(
+        label="How It Works",
+        emoji="ℹ️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="nftmarket:menu:help",
+        row=2,
+    )
     async def how_it_works(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await send_help(interaction)
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
-        logger.exception("NFT Market menu button error", exc_info=error)
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        logger.exception("QuickSell menu button error", exc_info=error)
         message = "An error occurred. Please try again in a moment."
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
@@ -2138,17 +2106,26 @@ async def on_ready() -> None:
                     guild.id,
                     guild.name,
                 )
-        # One full-history cleanup on startup removes menus from previous days.
-        # Only messages identified as NFT Market menus are touched.
+        # Remove every stale public menu, then publish one fresh QuickSell menu.
         for guild in bot.guilds:
             for channel in guild.text_channels:
                 if channel.name.endswith("bot-commands"):
-                    deleted = await cleanup_old_market_menus(channel, limit=None)
-                    logger.info(
-                        "Startup NFT Market menu cleanup in #%s: deleted=%d",
-                        channel.name,
-                        deleted,
-                    )
+                    await cleanup_old_market_menus(channel, limit=None)
+                    try:
+                        embed = discord.Embed(
+                            title="🖼️ QuickSell",
+                            description=(
+                                "Find a buyer or seller before you pay.\n\n"
+                                "🛒 **I Want to Buy**\n"
+                                "💰 **I Want to Sell**\n\n"
+                                "🔎 Searching is free. A 24H/48H pass is requested only "
+                                "after a compatible match is found."
+                            ),
+                            color=discord.Color.blurple(),
+                        )
+                        await channel.send(embed=embed, view=MainMenuView())
+                    except (discord.Forbidden, discord.HTTPException):
+                        logger.exception("Could not publish QuickSell menu in #%s.", channel.name)
 
         logger.info("NFT Market Bot is ready.")
 
