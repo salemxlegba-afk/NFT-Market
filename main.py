@@ -799,6 +799,7 @@ class NFTMarketBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.start_wallet_web_server()
         self.add_view(MainMenuView())
+        self.add_view(AccessPlanView())
         synced = await self.tree.sync()
         logger.info("Synced %d slash commands.", len(synced))
         if self.market_menu_task is None or self.market_menu_task.done():
@@ -2122,6 +2123,7 @@ async def on_ready() -> None:
     if not bot.ready_message_sent:
         bot.ready_message_sent = True
         bot.add_view(MainMenuView())
+        bot.add_view(AccessPlanView())
         bot.add_view(DealActionView())
         logger.info("Connected to Discord as %s (ID: %s).", bot.user, bot.user.id if bot.user else "unknown")
         for guild in bot.guilds:
