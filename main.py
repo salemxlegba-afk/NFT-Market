@@ -793,12 +793,35 @@ class NFTMarketBot(commands.Bot):
         self.ready_message_sent = False
         self.wallet_web_runner: Optional[web.AppRunner] = None
         self.wallet_web_port = self._get_wallet_web_port()
+        self.market_menu_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
         await self.start_wallet_web_server()
         self.add_view(MainMenuView())
         synced = await self.tree.sync()
         logger.info("Synced %d slash commands.", len(synced))
+        if self.market_menu_task is None or self.market_menu_task.done():
+            self.market_menu_task = asyncio.create_task(
+                self._refresh_market_menu_loop(),
+                name="nftmarket-menu-refresh",
+            )
+
+    async def _refresh_market_menu_loop(self) -> None:
+        """Refresh the public market menu once per minute without touching user messages."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            for guild in self.guilds:
+                channel = next(
+                    (
+                        candidate
+                        for candidate in guild.text_channels
+                        if candidate.name.endswith("bot-commands")
+                    ),
+                    None,
+                )
+                if channel is not None:
+                    await refresh_market_menu(channel)
+            await asyncio.sleep(60)
 
     @staticmethod
     def _get_wallet_web_port() -> int:
@@ -1867,7 +1890,7 @@ async def cleanup_old_market_menus(
 
     # history() is newest-first, so preserve the newest menu when no explicit
     # message was supplied. This makes startup cleanup safe and deterministic.
-    preserved_id = keep_message_id or market_messages[0].id
+    preserved_id = market_messages[0].id if keep_message_id is None else keep_message_id
     for message in market_messages:
         if message.id == preserved_id:
             continue
@@ -1875,6 +1898,28 @@ async def cleanup_old_market_menus(
             await message.delete(reason="NFT Market UI cleanup: stale menu")
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+
+
+async def refresh_market_menu(channel: discord.TextChannel) -> None:
+    """Delete every old NFT Market menu and post exactly one fresh menu."""
+    try:
+        buyer_count, seller_count = await STORE.active_counts(channel.guild.id)
+        await cleanup_old_market_menus(channel, keep_message_id=-1, limit=200)
+        # cleanup_old_market_menus preserves one menu when no keep id exists;
+        # -1 intentionally matches none, so every stale market menu is deleted.
+        embed = discord.Embed(
+            title="🖼️ NFT Market",
+            description=(
+                "Buy, sell, and find matching counterparties in the private market.\\n\\n"
+                f"🟢 **Active Buyers: {buyer_count}**\\n"
+                f"🔴 **Active Sellers: {seller_count}**\\n\\n"
+                "The counters represent users who currently have an active request."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await channel.send(embed=embed, view=MainMenuView())
+    except (discord.Forbidden, discord.HTTPException):
+        return
 
 
 async def send_access_offers(interaction: discord.Interaction) -> None:
