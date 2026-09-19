@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import timedelta, timezone, datetime
 from decimal import Decimal, ROUND_UP
 
@@ -14,6 +15,7 @@ from payments import ACCESS_PLANS, PAYMENT_WALLET
 RPC_URL = "https://api.mainnet-beta.solana.com"
 PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
 LAMPORTS_PER_SOL = Decimal("1000000000")
+TEST_PAYMENT_MODE = os.getenv("NFTMARKET_TEST_PAYMENT", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def encode_base58(raw: bytes) -> str:
@@ -176,6 +178,7 @@ def access_embed(plan_id: str, sol_amount: Decimal, reference: str) -> discord.E
     plan = ACCESS_PLANS[plan_id]
     usd_label = str(plan["usd"])
     hours = int(plan["hours"])
+    mode_label = "\n\n🧪 **TEST MODE:** payment verification is simulated; no SOL is required." if TEST_PAYMENT_MODE else ""
     embed = discord.Embed(
         title=f"💳 {plan['label']}",
         description=(
@@ -185,6 +188,7 @@ def access_embed(plan_id: str, sol_amount: Decimal, reference: str) -> discord.E
             "Then press **Check Payment**.\n\n"
             "⚠️ Paid access gives you time to search for a match; "
             "it does **not** guarantee a sale or match."
+            f"{mode_label}"
         ),
         color=discord.Color.blurple(),
     )
@@ -211,13 +215,16 @@ class PaymentCheckView(discord.ui.View):
                     rounding=ROUND_UP
                 )
             )
-            signature = await find_payment(self.reference, lamports, self.created_at)
-            if signature is None:
-                await interaction.followup.send(
-                    "⏳ Payment not detected yet. Make sure the exact SOL amount was sent and wait for final confirmation.",
-                    ephemeral=True,
-                )
-                return
+            if TEST_PAYMENT_MODE:
+                signature = f"TEST-{interaction.id}"
+            else:
+                signature = await find_payment(self.reference, lamports, self.created_at)
+                if signature is None:
+                    await interaction.followup.send(
+                        "⏳ Payment not detected yet. Make sure the exact SOL amount was sent and wait for final confirmation.",
+                        ephemeral=True,
+                    )
+                    return
             client = getattr(interaction.client, "paid_access_client", None)
             if client is None:
                 await interaction.followup.send("⚠️ Payment storage is not configured.", ephemeral=True)
