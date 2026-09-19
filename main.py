@@ -1969,14 +1969,9 @@ async def cleanup_old_market_menus(
 
 
 async def refresh_market_menu(channel: discord.TextChannel) -> None:
-    """Remove old menus first, then publish one fresh menu."""
+    """Publish the market menu only when explicitly requested."""
     try:
         buyer_count, seller_count = await STORE.active_counts(channel.guild.id)
-        deleted = await cleanup_old_market_menus(
-            channel,
-            keep_message_id=None,
-            limit=200,
-        )
         embed = discord.Embed(
             title="🖼️ NFT Market",
             description=(
@@ -1989,14 +1984,13 @@ async def refresh_market_menu(channel: discord.TextChannel) -> None:
         )
         new_menu = await channel.send(embed=embed, view=MainMenuView())
         logger.info(
-            "NFT Market menu refreshed in #%s: deleted=%d new_message=%s",
+            "NFT Market menu published in #%s: new_message=%s",
             channel.name,
-            deleted,
             new_menu.id,
         )
     except (discord.Forbidden, discord.HTTPException) as exc:
         logger.warning(
-            "Could not refresh NFT Market menu in #%s: %s",
+            "Could not publish NFT Market menu in #%s: %s",
             getattr(channel, "name", "unknown"),
             exc,
         )
