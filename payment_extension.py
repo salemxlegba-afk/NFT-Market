@@ -195,7 +195,8 @@ class PaymentCheckView(discord.ui.View):
 
 class AccessPlanView(discord.ui.View):
     def __init__(self) -> None:
-        super().__init__(timeout=180)
+        # Keep checkout choices available long enough for the user to complete payment.
+        super().__init__(timeout=1800)
 
     async def choose(self, interaction: discord.Interaction, plan_id: str) -> None:
         await interaction.response.defer(ephemeral=True)
