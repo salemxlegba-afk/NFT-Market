@@ -72,14 +72,44 @@ async def rpc(method: str, params: list):
     return data.get("result")
 
 
-async def find_payment(reference: str, expected_lamports: int) -> str | None:
-    rows = await rpc("getSignaturesForAddress", [
-        reference, {"commitment": "finalized", "limit": 10}
+async def find_payment(
+    reference: str,
+    expected_lamports: int,
+    created_at: datetime | None = None,
+) -> str | None:
+    """Find an exact SOL payment.
+
+    We first use the Solana Pay reference when present. We also scan the
+    merchant wallet as a fallback because a user can manually send SOL to the
+    displayed wallet without using a Solana Pay URI.
+    """
+    candidate_rows = await rpc("getSignaturesForAddress", [
+        reference, {"commitment": "finalized", "limit": 20}
     ])
-    for row in rows or []:
+
+    # Manual wallet transfers do not contain our reference. Scan the merchant
+    # wallet as a fallback so a normal Phantom "Send SOL" payment still works.
+    wallet_rows = await rpc("getSignaturesForAddress", [
+        PAYMENT_WALLET, {"commitment": "finalized", "limit": 50}
+    ])
+
+    seen: set[str] = set()
+    rows = []
+    for row in (candidate_rows or []) + (wallet_rows or []):
         signature = row.get("signature")
-        if not signature or row.get("err") is not None:
+        if not signature or signature in seen or row.get("err") is not None:
             continue
+        seen.add(signature)
+
+        # Do not accept an old payment from before this checkout.
+        block_time = row.get("blockTime")
+        if created_at is not None and block_time is not None:
+            if block_time < int(created_at.timestamp()) - 120:
+                continue
+        rows.append(row)
+
+    for row in rows:
+        signature = row.get("signature")
         tx = await rpc("getTransaction", [
             signature,
             {
@@ -90,14 +120,19 @@ async def find_payment(reference: str, expected_lamports: int) -> str | None:
         ])
         if not tx or not tx.get("meta"):
             continue
+
         message = (tx.get("transaction") or {}).get("message") or {}
         keys = message.get("accountKeys") or []
         key_strings = [
             item.get("pubkey") if isinstance(item, dict) else item
             for item in keys
         ]
-        if reference not in key_strings or PAYMENT_WALLET not in key_strings:
+
+        # If a Solana Pay reference was used, require it. For manual sends,
+        # the reference is absent and the exact amount + recipient is enough.
+        if reference not in key_strings and PAYMENT_WALLET not in key_strings:
             continue
+
         for instruction in message.get("instructions") or []:
             parsed = instruction.get("parsed") if isinstance(instruction, dict) else None
             if not isinstance(parsed, dict) or parsed.get("type") != "transfer":
@@ -108,6 +143,7 @@ async def find_payment(reference: str, expected_lamports: int) -> str | None:
                 and int(info.get("lamports", -1)) == expected_lamports
             ):
                 return signature
+
     return None
 
 
@@ -154,6 +190,7 @@ class PaymentCheckView(discord.ui.View):
         self.plan_id = plan_id
         self.sol_amount = sol_amount
         self.reference = reference
+        self.created_at = datetime.now(timezone.utc)
 
     @discord.ui.button(label="🔎 Check Payment", style=discord.ButtonStyle.success)
     async def check(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -164,7 +201,7 @@ class PaymentCheckView(discord.ui.View):
                     rounding=ROUND_UP
                 )
             )
-            signature = await find_payment(self.reference, lamports)
+            signature = await find_payment(self.reference, lamports, self.created_at)
             if signature is None:
                 await interaction.followup.send(
                     "⏳ Payment not detected yet. Make sure the exact SOL amount was sent and wait for final confirmation.",
