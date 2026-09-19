@@ -30,6 +30,7 @@ from discord import app_commands
 from discord.ext import commands
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
+from payment_extension import AccessPlanView
 
 
 PRIVATE_MARKET_CATEGORY = "🔐 PRIVATE MARKET"
@@ -2017,7 +2018,11 @@ async def send_access_offers(interaction: discord.Interaction) -> None:
         ),
         color=discord.Color.blurple(),
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(
+        embed=embed,
+        view=AccessPlanView(),
+        ephemeral=True,
+    )
 
 
 class MainMenuView(discord.ui.View):

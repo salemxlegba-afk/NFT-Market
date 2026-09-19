@@ -241,16 +241,3 @@ async def access_callback(self, interaction: discord.Interaction, button: discor
         ephemeral=True,
     )
 
-
-_original_button = discord.ui.button
-
-
-def _patched_button(*args, **kwargs):
-    if kwargs.get("custom_id") == "nftmarket:menu:access":
-        def decorator(_original_callback):
-            return _original_button(*args, **kwargs)(access_callback)
-        return decorator
-    return _original_button(*args, **kwargs)
-
-
-discord.ui.button = _patched_button
