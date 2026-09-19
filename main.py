@@ -1439,18 +1439,110 @@ class DealActionView(discord.ui.View):
         match = next((item for item in matches if item.channel_id == channel_id), None)
         return match.match_id if match is not None else None
 
-    @discord.ui.button(label="Complete Deal", emoji="✅", style=discord.ButtonStyle.success, custom_id="nftmarket:deal:complete")
-    async def complete(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    @discord.ui.button(
+        label="Complete Deal",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="nftmarket:deal:complete",
+    )
+    async def complete(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         bot = interaction.client
         if isinstance(bot, NFTMarketBot):
             match_id = await self._get_match_id(interaction)
             if match_id is None:
-                await interaction.response.send_message("This deal could not be found.", ephemeral=True)
+                await interaction.response.send_message(
+                    "This deal could not be found.", ephemeral=True
+                )
                 return
             await bot.change_deal_status(interaction, match_id, "COMPLETED")
 
-    @discord.ui.button(label="Cancel Deal", emoji="❌", style=discord.ButtonStyle.danger, custom_id="nftmarket:deal:cancel")
-    async def cancel(interaction: discord.Interaction, request_type: app_commands.Choice[str]) -> None:
+    @discord.ui.button(
+        label="Cancel Deal",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+        custom_id="nftmarket:deal:cancel",
+    )
+    async def cancel_deal(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        bot = interaction.client
+        if isinstance(bot, NFTMarketBot):
+            match_id = await self._get_match_id(interaction)
+            if match_id is None:
+                await interaction.response.send_message(
+                    "This deal could not be found.", ephemeral=True
+                )
+                return
+            await bot.change_deal_status(interaction, match_id, "CANCELLED")
+
+
+@bot.tree.command(name="matches", description="Show your current matches.")
+@app_commands.guild_only()
+async def matches(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This can only be used inside a Discord server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await STORE.reconcile(guild.id)
+
+    user_matches = await STORE.matches_for_user(interaction.user.id)
+    visible_matches = [
+        m for m in user_matches
+        if getattr(m, "status", "MATCHED") == "MATCHED"
+    ][-10:]
+
+    if not visible_matches:
+        await interaction.followup.send(
+            "🔎 No match yet. Your request is still being monitored.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🎯 Match found",
+        description=(
+            "QuickSell found a compatible counterparty.\n\n"
+            "The identity and private contact stay hidden until you unlock the match."
+        ),
+        color=discord.Color.gold(),
+    )
+    for match in visible_matches:
+        embed.add_field(
+            name=f"🎯 {match.seller.collection} · {match.match_id}",
+            value=(
+                f"Seller price: **{format_amount(match.seller.amount, match.seller.currency)}**\n"
+                "🔒 Counterparty details hidden\n"
+                "Use **👀 View / Contact** to continue."
+            ),
+            inline=False,
+        )
+    latest = visible_matches[-1]
+    await interaction.followup.send(
+        embed=embed,
+        view=MatchUnlockView(latest.match_id),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="cancel", description="Cancel an active buy or sell request.")
+@app_commands.guild_only()
+@app_commands.describe(request_type="Which active request should be cancelled?")
+@app_commands.choices(
+    request_type=[
+        app_commands.Choice(name="Buy request", value="buy"),
+        app_commands.Choice(name="Sell request", value="sell"),
+        app_commands.Choice(name="Both", value="both"),
+    ]
+)
+async def cancel(
+    interaction: discord.Interaction, request_type: app_commands.Choice[str]
+) -> None:
     cancelled = await STORE.cancel_latest(interaction.user.id, request_type.value)
     if not cancelled:
         await interaction.response.send_message(
@@ -1464,7 +1556,6 @@ class DealActionView(discord.ui.View):
         f"Cancelled: **{names}**.",
         ephemeral=True,
     )
-
 
 @bot.tree.interaction_check
 async def on_tree_interaction_check(interaction: discord.Interaction) -> bool:
