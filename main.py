@@ -794,7 +794,6 @@ class NFTMarketBot(commands.Bot):
         self.ready_message_sent = False
         self.wallet_web_runner: Optional[web.AppRunner] = None
         self.wallet_web_port = self._get_wallet_web_port()
-        self.market_menu_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
         await self.start_wallet_web_server()
@@ -802,28 +801,6 @@ class NFTMarketBot(commands.Bot):
         self.add_view(AccessPlanView())
         synced = await self.tree.sync()
         logger.info("Synced %d slash commands.", len(synced))
-        if self.market_menu_task is None or self.market_menu_task.done():
-            self.market_menu_task = asyncio.create_task(
-                self._refresh_market_menu_loop(),
-                name="nftmarket-menu-refresh",
-            )
-
-    async def _refresh_market_menu_loop(self) -> None:
-        """Refresh the public market menu once per minute without touching user messages."""
-        await self.wait_until_ready()
-        while not self.is_closed():
-            for guild in self.guilds:
-                channel = next(
-                    (
-                        candidate
-                        for candidate in guild.text_channels
-                        if candidate.name.endswith("bot-commands")
-                    ),
-                    None,
-                )
-                if channel is not None:
-                    await refresh_market_menu(channel)
-            await asyncio.sleep(60)
 
     @staticmethod
     def _get_wallet_web_port() -> int:
