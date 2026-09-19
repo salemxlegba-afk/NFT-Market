@@ -1356,10 +1356,10 @@ class NFTMarketBot(commands.Bot):
                         if menu_channel is not None:
                             buyer_count, seller_count = await STORE.active_counts(guild.id)
                             embed = discord.Embed(
-                                title="🖼️ NFT Market",
+                                title="🖼️ QuickSell",
                                 description=(
                                     "❌ **Deal cancelled successfully.**\n\n"
-                                    "You can continue using the NFT Market below.\n\n"
+                                    "You can continue using QuickSell below.\n\n"
                                     f"🟢 **Active Buyers: {buyer_count}**\n"
                                     f"🔴 **Active Sellers: {seller_count}**\n\n"
                                     "The counters represent users who currently have an active request."
@@ -1822,7 +1822,7 @@ async def _is_nft_market_menu(message: discord.Message) -> bool:
         return False
 
     if any(
-        getattr(embed, "title", None) == "🖼️ NFT Market"
+        getattr(embed, "title", None) in {"🖼️ NFT Market", "🖼️ QuickSell"}
         for embed in getattr(message, "embeds", [])
     ):
         return True
