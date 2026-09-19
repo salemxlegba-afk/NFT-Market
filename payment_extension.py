@@ -186,8 +186,8 @@ def access_embed(plan_id: str, sol_amount: Decimal, reference: str) -> discord.E
             f"**Send:** {sol_amount:.6f} SOL\n\n"
             "Send the exact amount to the payment wallet below.\n"
             "Then press **Check Payment**.\n\n"
-            "⚠️ Paid access gives you time to search for a match; "
-            "it does **not** guarantee a sale or match."
+            "🔓 Paid access unlocks the matched counterparty and contact channel. "
+            "It does **not** guarantee that a deal will close."
             f"{mode_label}"
         ),
         color=discord.Color.blurple(),
