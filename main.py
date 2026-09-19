@@ -1355,7 +1355,12 @@ class NFTMarketBot(commands.Bot):
                                 ),
                                 color=discord.Color.blurple(),
                             )
-                            await menu_channel.send(embed=embed, view=MainMenuView())
+                            new_menu = await menu_channel.send(embed=embed, view=MainMenuView())
+                            await cleanup_old_market_menus(
+                                menu_channel,
+                                keep_message_id=new_menu.id,
+                                limit=200,
+                            )
                 await asyncio.sleep(60)
                 await channel.delete(reason=f"NFT Market deal {status.lower()}")
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -1740,6 +1745,15 @@ async def menu(interaction: discord.Interaction) -> None:
         color=discord.Color.blurple(),
     )
     await interaction.response.send_message(embed=embed, view=MainMenuView())
+    try:
+        new_menu = await interaction.original_response()
+        await cleanup_old_market_menus(
+            interaction.channel,
+            keep_message_id=new_menu.id,
+            limit=200,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 async def send_my_requests(interaction: discord.Interaction) -> None:
@@ -1820,6 +1834,47 @@ class TradeChoiceView(discord.ui.View):
         else:
             content = f"📤 **Sell an NFT**\n\n🟢 **{buyer_count} active buyers currently.**\n\nClick **Continue** to list your NFT."
         await interaction.response.edit_message(content=content, view=self)
+
+
+async def cleanup_old_market_menus(
+    channel: discord.abc.Messageable,
+    keep_message_id: Optional[int] = None,
+    limit: int = 200,
+) -> None:
+    """Remove only stale NFT Market menu embeds from one channel.
+
+    User requests, deal messages, wallet messages, and normal conversation are
+    never touched. When no message is specified to keep, the newest market
+    menu is preserved and older duplicates are removed.
+    """
+    try:
+        messages = [message async for message in channel.history(limit=limit)]
+    except (discord.Forbidden, discord.HTTPException):
+        return
+
+    market_messages = []
+    for message in messages:
+        if getattr(message.author, "bot", False) is not True:
+            continue
+        if any(
+            getattr(embed, "title", None) == "🖼️ NFT Market"
+            for embed in getattr(message, "embeds", [])
+        ):
+            market_messages.append(message)
+
+    if not market_messages:
+        return
+
+    # history() is newest-first, so preserve the newest menu when no explicit
+    # message was supplied. This makes startup cleanup safe and deterministic.
+    preserved_id = keep_message_id or market_messages[0].id
+    for message in market_messages:
+        if message.id == preserved_id:
+            continue
+        try:
+            await message.delete(reason="NFT Market UI cleanup: stale menu")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
 
 
 async def send_access_offers(interaction: discord.Interaction) -> None:
@@ -1976,6 +2031,12 @@ async def on_ready() -> None:
                     guild.id,
                     guild.name,
                 )
+        # Clean stale duplicate market menus after every restart while
+        # preserving the newest one in each channel.
+        for guild in bot.guilds:
+            for channel in guild.text_channels:
+                await cleanup_old_market_menus(channel, limit=200)
+
         logger.info("NFT Market Bot is ready.")
 
 
