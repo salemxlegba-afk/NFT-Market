@@ -1,6 +1,7 @@
 """Direct SOL paid-access integration for NFT Market."""
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta, timezone, datetime
 from decimal import Decimal, ROUND_UP
 
