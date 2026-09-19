@@ -190,7 +190,7 @@ class PaymentCheckView(discord.ui.View):
         self.plan_id = plan_id
         self.sol_amount = sol_amount
         self.reference = reference
-        self.created_at = datetime.now(timezone.utc)
+        self.created_at = datetime.now(timezone.utc) - timedelta(minutes=15)
 
     @discord.ui.button(label="🔎 Check Payment", style=discord.ButtonStyle.success)
     async def check(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
