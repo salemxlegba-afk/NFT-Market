@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import timedelta, timezone, datetime
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_UP
 
 import aiohttp
 import discord
@@ -31,15 +31,29 @@ def new_reference() -> str:
 
 
 async def sol_usd() -> Decimal:
+    """Get a live SOL/USD quote with a public fallback source."""
+    urls = (
+        PRICE_URL,
+        "https://api.coinbase.com/v2/prices/SOL-USD/spot",
+    )
+    last_error: Exception | None = None
     async with aiohttp.ClientSession() as session:
-        async with session.get(PRICE_URL, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
-                raise RuntimeError("SOL/USD quote unavailable")
-            data = await resp.json()
-    price = Decimal(str(data["solana"]["usd"]))
-    if price <= 0:
-        raise RuntimeError("Invalid SOL/USD quote")
-    return price
+        for url in urls:
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"quote HTTP {resp.status}")
+                    data = await resp.json()
+                    if "coingecko" in url:
+                        price = Decimal(str(data["solana"]["usd"]))
+                    else:
+                        price = Decimal(str(data["data"]["amount"]))
+                    if price <= 0:
+                        raise RuntimeError("invalid quote")
+                    return price
+            except Exception as exc:
+                last_error = exc
+    raise RuntimeError("SOL/USD quote unavailable") from last_error
 
 
 async def rpc(method: str, params: list):
@@ -146,7 +160,7 @@ class PaymentCheckView(discord.ui.View):
         try:
             lamports = int(
                 (self.sol_amount * LAMPORTS_PER_SOL).to_integral_value(
-                    rounding=ROUND_DOWN
+                    rounding=ROUND_UP
                 )
             )
             signature = await find_payment(self.reference, lamports)
@@ -188,7 +202,7 @@ class AccessPlanView(discord.ui.View):
         try:
             usd = Decimal(str(ACCESS_PLANS[plan_id]["usd"]))
             quote_usd = await sol_usd()
-            sol_amount = (usd / quote_usd).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+            sol_amount = (usd / quote_usd).quantize(Decimal("0.000001"), rounding=ROUND_UP)
             reference = new_reference()
             await interaction.followup.send(
                 embed=access_embed(plan_id, sol_amount, reference),
