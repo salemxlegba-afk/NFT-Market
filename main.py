@@ -1938,34 +1938,12 @@ async def cleanup_old_market_menus(
     keep_message_id: Optional[int] = None,
     limit: Optional[int] = 200,
 ) -> int:
-    """Delete stale NFT Market menus without touching user messages."""
-    deleted = 0
-    try:
-        messages = [message async for message in channel.history(limit=limit)]
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning(
-            "Could not read NFT Market menu history in #%s: %s",
-            getattr(channel, "name", "unknown"),
-            exc,
-        )
-        return 0
-
-    for message in messages:
-        if message.id == keep_message_id:
-            continue
-        if not await _is_nft_market_menu(message):
-            continue
-        try:
-            await message.delete()
-            deleted += 1
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning(
-                "Could not delete old NFT Market menu message=%s in #%s: %s",
-                message.id,
-                getattr(channel, "name", "unknown"),
-                exc,
-            )
-    return deleted
+    """Deletion is disabled: never remove NFT Market menu messages."""
+    logger.info(
+        "NFT Market menu deletion disabled in #%s; no messages deleted.",
+        getattr(channel, "name", "unknown"),
+    )
+    return 0
 
 
 async def refresh_market_menu(channel: discord.TextChannel) -> None:
