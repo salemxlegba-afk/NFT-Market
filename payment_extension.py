@@ -133,15 +133,25 @@ async def find_payment(
         if reference not in key_strings and PAYMENT_WALLET not in key_strings:
             continue
 
-        for instruction in message.get("instructions") or []:
+        # Phantom/manual SOL sends can appear either as top-level parsed
+        # instructions or as inner instructions. Inspect both locations.
+        instructions = list(message.get("instructions") or [])
+        meta = tx.get("meta") or {}
+        for group in meta.get("innerInstructions") or []:
+            instructions.extend(group.get("instructions") or [])
+
+        for instruction in instructions:
             parsed = instruction.get("parsed") if isinstance(instruction, dict) else None
             if not isinstance(parsed, dict) or parsed.get("type") != "transfer":
                 continue
             info = parsed.get("info") or {}
-            if (
-                info.get("destination") == PAYMENT_WALLET
-                and int(info.get("lamports", -1)) == expected_lamports
-            ):
+            destination = info.get("destination")
+            lamports_raw = info.get("lamports")
+            try:
+                lamports = int(lamports_raw)
+            except (TypeError, ValueError):
+                continue
+            if destination == PAYMENT_WALLET and lamports == expected_lamports:
                 return signature
 
     return None
