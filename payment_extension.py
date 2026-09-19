@@ -194,9 +194,10 @@ class PaymentCheckView(discord.ui.View):
 
 
 class AccessPlanView(discord.ui.View):
+    """Persistent access-plan selector."""
     def __init__(self) -> None:
-        # Keep checkout choices available long enough for the user to complete payment.
-        super().__init__(timeout=1800)
+        # Fixed custom IDs + timeout=None keep these buttons valid after restarts.
+        super().__init__(timeout=None)
 
     async def choose(self, interaction: discord.Interaction, plan_id: str) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -216,11 +217,11 @@ class AccessPlanView(discord.ui.View):
                 ephemeral=True,
             )
 
-    @discord.ui.button(label="24H — $8", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="24H — $8", style=discord.ButtonStyle.primary, custom_id="nftmarket:access:24h")
     async def plan_24(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.choose(interaction, "24h")
 
-    @discord.ui.button(label="48H — $15", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="48H — $15", style=discord.ButtonStyle.primary, custom_id="nftmarket:access:48h")
     async def plan_48(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.choose(interaction, "48h")
 
