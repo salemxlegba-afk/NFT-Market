@@ -2119,6 +2119,34 @@ async def on_app_command_error(
 
 
 @bot.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    """Fallback dispatcher for paid-access buttons if the View is not attached to the message cache."""
+    if interaction.type is not discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    custom_id = data.get("custom_id") if isinstance(data, dict) else None
+    if custom_id not in {"nftmarket:access:24h", "nftmarket:access:48h"}:
+        return
+    plan_id = custom_id.rsplit(":", 1)[-1]
+    logger.info("Paid access component received: %s", custom_id)
+    try:
+        from payment_extension import handle_access_plan_interaction
+        await handle_access_plan_interaction(interaction, plan_id)
+    except Exception:
+        logger.exception("Paid access interaction failed: %s", custom_id)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "⚠️ The access button failed. Please open Get Access again and retry.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "⚠️ The access button failed. Please open Get Access again and retry.",
+                ephemeral=True,
+            )
+
+
+@bot.event
 async def on_ready() -> None:
     if not bot.ready_message_sent:
         bot.ready_message_sent = True
