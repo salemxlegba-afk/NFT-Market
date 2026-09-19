@@ -1956,7 +1956,7 @@ async def cleanup_old_market_menus(
         if not await _is_nft_market_menu(message):
             continue
         try:
-            await message.delete(reason="NFT Market UI cleanup")
+            await message.delete()
             deleted += 1
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
             logger.warning(
