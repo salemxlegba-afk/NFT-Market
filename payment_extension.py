@@ -194,28 +194,12 @@ class PaymentCheckView(discord.ui.View):
 
 
 class AccessPlanView(discord.ui.View):
-    """Persistent access-plan selector."""
+    """Persistent access-plan selector with a guarded checkout handler."""
     def __init__(self) -> None:
-        # Fixed custom IDs + timeout=None keep these buttons valid after restarts.
         super().__init__(timeout=None)
 
     async def choose(self, interaction: discord.Interaction, plan_id: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            usd = Decimal(str(ACCESS_PLANS[plan_id]["usd"]))
-            quote_usd = await sol_usd()
-            sol_amount = (usd / quote_usd).quantize(Decimal("0.000001"), rounding=ROUND_UP)
-            reference = new_reference()
-            await interaction.followup.send(
-                embed=access_embed(plan_id, sol_amount, reference),
-                view=PaymentCheckView(plan_id, sol_amount, reference),
-                ephemeral=True,
-            )
-        except Exception:
-            await interaction.followup.send(
-                "⚠️ I could not calculate the current SOL amount. Please try again shortly.",
-                ephemeral=True,
-            )
+        await handle_access_plan_interaction(interaction, plan_id)
 
     @discord.ui.button(label="24H — $8", style=discord.ButtonStyle.primary, custom_id="nftmarket:access:24h")
     async def plan_24(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -224,6 +208,39 @@ class AccessPlanView(discord.ui.View):
     @discord.ui.button(label="48H — $15", style=discord.ButtonStyle.primary, custom_id="nftmarket:access:48h")
     async def plan_48(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.choose(interaction, "48h")
+
+
+_access_interaction_lock = asyncio.Lock()
+_access_interactions_handled: set[int] = set()
+
+
+async def handle_access_plan_interaction(interaction: discord.Interaction, plan_id: str) -> None:
+    """Handle checkout once, even if Discord delivers the component through two paths."""
+    async with _access_interaction_lock:
+        if interaction.id in _access_interactions_handled:
+            return
+        _access_interactions_handled.add(interaction.id)
+        if len(_access_interactions_handled) > 2000:
+            _access_interactions_handled.clear()
+        if interaction.response.is_done():
+            return
+        await interaction.response.defer(ephemeral=True)
+
+    try:
+        usd = Decimal(str(ACCESS_PLANS[plan_id]["usd"]))
+        quote_usd = await sol_usd()
+        sol_amount = (usd / quote_usd).quantize(Decimal("0.000001"), rounding=ROUND_UP)
+        reference = new_reference()
+        await interaction.followup.send(
+            embed=access_embed(plan_id, sol_amount, reference),
+            view=PaymentCheckView(plan_id, sol_amount, reference),
+            ephemeral=True,
+        )
+    except Exception:
+        await interaction.followup.send(
+            "⚠️ I could not calculate the current SOL amount. Please try again shortly.",
+            ephemeral=True,
+        )
 
 
 async def access_callback(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
