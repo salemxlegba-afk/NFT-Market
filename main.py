@@ -886,7 +886,7 @@ class QuickSellBot(commands.Bot):
                     ids = [getattr(c, "custom_id", None) for r in message.components for c in r.children]
                     if any(i in QUICKSELL_MENU_CUSTOM_IDS for i in ids):
                         try:
-                           await message.delete()
+                            await message.delete()
                             print(f"[QuickSell] removed stray menu from #{channel.name}")
                         except discord.Forbidden:
                             print(f"[QuickSell] cannot delete stray menu in #{channel.name}: missing Manage Messages")
