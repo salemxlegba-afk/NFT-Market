@@ -201,13 +201,20 @@ async def verify_solana_payment(signature: str, expected_sol: float) -> tuple[st
         [[signature], {"searchTransactionHistory": True}],
     )
     if status_response is None:
-        return "PENDING", None
+    return "PENDING", None
+
+if status_response.get("error") is not None:
+    return "INVALID", None
     statuses = (status_response.get("result") or {}).get("value") or []
-    status = statuses[0] if statuses else None
-    if status is None:
-        return "PENDING", None
-    if status.get("err") is not None:
-        return "INVALID", None
+   status = statuses[0] if statuses else None
+
+# Aucune transaction trouvée pour cette signature
+if status is None:
+    return "INVALID", None
+
+# La transaction existe mais Solana indique une erreur
+if status.get("err") is not None:
+    return "INVALID", None
     confirmation = status.get("confirmationStatus")
     if confirmation not in {"confirmed", "finalized"}:
         return "PENDING", None
@@ -495,8 +502,8 @@ class SignatureModal(discord.ui.Modal):
             label="Solana transaction signature",
             placeholder="Paste the transaction signature",
             required=True,
-            min_length=40,
-            max_length=100,
+           min_length=87,
+           max_length=88,
         )
         self.add_item(self.signature)
 
