@@ -354,7 +354,31 @@ async def matching_loop(bot: commands.Bot):
         await asyncio.sleep(MATCH_INTERVAL)
 
 
-class RequestModal(discord.ui.Modal):
+class QuickSellModal(discord.ui.Modal):
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        print(
+            f"[QuickSell] MODAL ERROR: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ QuickSell encountered an internal error. Please try again.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ QuickSell encountered an internal error. Please try again.",
+                    ephemeral=True,
+                )
+        except Exception as follow_error:
+            print(
+                f"[QuickSell] ERROR WHILE REPORTING MODAL ERROR: {type(follow_error).__name__}: {follow_error}",
+                flush=True,
+            )
+
+
+class RequestModal(QuickSellModal):
     def __init__(self, request_type: RequestType):
         super().__init__(title="QuickSell • Create Request")
         self.request_type = request_type
@@ -402,14 +426,50 @@ class RequestModal(discord.ui.Modal):
         )
 
 
-class MatchContactView(discord.ui.View):
-    def __init__(self, match_id: int):
-        super().__init__(timeout=24 * 60 * 60)
-        self.match_id = match_id
+class QuickSellView(discord.ui.View):
+    """Base view that never leaves a Discord interaction unanswered.
 
-    @discord.ui.button(label="Contact Interested Party", emoji="📩", style=discord.ButtonStyle.success)
-    async def contact(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_contact(interaction, self.match_id)
+    Any unexpected exception inside a button/modal callback is reported to the
+    user and printed to the runtime instead of producing Discord's generic
+    “The application didn’t respond in time” message.
+    """
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        print(
+            f"[QuickSell] INTERACTION ERROR: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ QuickSell encountered an internal error while processing this button. Please try again.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ QuickSell encountered an internal error while processing this button. Please try again.",
+                    ephemeral=True,
+                )
+        except Exception as follow_error:
+            print(
+                f"[QuickSell] ERROR WHILE REPORTING INTERACTION ERROR: {type(follow_error).__name__}: {follow_error}",
+                flush=True,
+            )
+
+
+class MatchContactView(QuickSellView):
+    def __init__(self, match_id: int):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+        button = discord.ui.Button(
+            label="Contact Interested Party", emoji="📩",
+            style=discord.ButtonStyle.success,
+            custom_id=f"quicksell:contact:{match_id}",
+        )
+        async def callback(interaction: discord.Interaction):
+            await handle_contact(interaction, match_id)
+        button.callback = callback
+        self.add_item(button)
 
 
 async def handle_contact(interaction: discord.Interaction, match_id: int):
@@ -476,7 +536,7 @@ def access_embed(match: sqlite3.Row) -> discord.Embed:
     )
 
 
-class AccessPlanView(discord.ui.View):
+class AccessPlanView(QuickSellView):
     def __init__(self, match_id: int):
         super().__init__(timeout=15 * 60)
         self.match_id = match_id
@@ -529,7 +589,7 @@ async def start_payment(interaction: discord.Interaction, match_id: int, hours: 
     )
 
 
-class SignatureModal(discord.ui.Modal):
+class SignatureModal(QuickSellModal):
     def __init__(self, pass_id: int):
         super().__init__(title="Verify Solana Payment")
         self.pass_id = pass_id
@@ -583,14 +643,19 @@ class SignatureModal(discord.ui.Modal):
                 pass
 
 
-class PaymentVerifyView(discord.ui.View):
+class PaymentVerifyView(QuickSellView):
     def __init__(self, pass_id: int):
-        super().__init__(timeout=15 * 60)
+        super().__init__(timeout=None)
         self.pass_id = pass_id
-
-    @discord.ui.button(label="Verify Payment", emoji="🔎", style=discord.ButtonStyle.success)
-    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SignatureModal(self.pass_id))
+        button = discord.ui.Button(
+            label="Verify Payment", emoji="🔎",
+            style=discord.ButtonStyle.success,
+            custom_id=f"quicksell:verify:{pass_id}",
+        )
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.send_modal(SignatureModal(pass_id))
+        button.callback = callback
+        self.add_item(button)
 
 
 async def verify_and_apply_payment(interaction: discord.Interaction, pass_id: int, signature: str) -> str:
@@ -630,14 +695,19 @@ async def verify_and_apply_payment(interaction: discord.Interaction, pass_id: in
     return state
 
 
-class DealAccessView(discord.ui.View):
+class DealAccessView(QuickSellView):
     def __init__(self, match_id: int):
-        super().__init__(timeout=24 * 60 * 60)
+        super().__init__(timeout=None)
         self.match_id = match_id
-
-    @discord.ui.button(label="📩 Open Private Deal Room", style=discord.ButtonStyle.success)
-    async def open_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await unlock_contact(interaction, self.match_id)
+        button = discord.ui.Button(
+            label="📩 Open Private Deal Room",
+            style=discord.ButtonStyle.success,
+            custom_id=f"quicksell:openroom:{match_id}",
+        )
+        async def callback(interaction: discord.Interaction):
+            await unlock_contact(interaction, match_id)
+        button.callback = callback
+        self.add_item(button)
 
 
 async def unlock_contact(interaction: discord.Interaction, match_id: int):
@@ -707,18 +777,28 @@ async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
     return channel
 
 
-class DealConfirmView(discord.ui.View):
+class DealConfirmView(QuickSellView):
     def __init__(self, match_id: int):
-        super().__init__(timeout=DEAL_CHANNEL_TTL_HOURS * 60 * 60)
+        super().__init__(timeout=None)
         self.match_id = match_id
-
-    @discord.ui.button(label="I AGREE TO THE DEAL", emoji="🤝", style=discord.ButtonStyle.success)
-    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await confirm_deal(interaction, self.match_id, True)
-
-    @discord.ui.button(label="I DON'T AGREE", emoji="❌", style=discord.ButtonStyle.danger)
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await confirm_deal(interaction, self.match_id, False)
+        agree = discord.ui.Button(
+            label="I AGREE TO THE DEAL", emoji="🤝",
+            style=discord.ButtonStyle.success,
+            custom_id=f"quicksell:agree:{match_id}",
+        )
+        decline = discord.ui.Button(
+            label="I DON'T AGREE", emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"quicksell:decline:{match_id}",
+        )
+        async def agree_callback(interaction: discord.Interaction):
+            await confirm_deal(interaction, match_id, True)
+        async def decline_callback(interaction: discord.Interaction):
+            await confirm_deal(interaction, match_id, False)
+        agree.callback = agree_callback
+        decline.callback = decline_callback
+        self.add_item(agree)
+        self.add_item(decline)
 
 
 async def confirm_deal(interaction: discord.Interaction, match_id: int, agree: bool):
@@ -757,7 +837,7 @@ async def confirm_deal(interaction: discord.Interaction, match_id: int, agree: b
     )
 
 
-class MainView(discord.ui.View):
+class MainView(QuickSellView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -829,7 +909,7 @@ class MainView(discord.ui.View):
         )
 
 
-class MyMatchesView(discord.ui.View):
+class MyMatchesView(QuickSellView):
     def __init__(self, rows):
         super().__init__(timeout=15 * 60)
         for row in rows[:5]:
@@ -844,6 +924,33 @@ class MyMatchesView(discord.ui.View):
         return callback
 
 
+def register_persistent_views(bot: commands.Bot) -> None:
+    """Re-register persistent views for active database records after every restart."""
+    bot.add_view(MainView())
+    con = db()
+    try:
+        matches = con.execute(
+            "SELECT id,status FROM matches WHERE status NOT IN (?,?,?) ORDER BY id DESC LIMIT 500",
+            (DealStatus.DECLINED.value, DealStatus.CLOSED.value, DealStatus.DEAL_CONFIRMED.value),
+        ).fetchall()
+        for row in matches:
+            bot.add_view(MatchContactView(int(row["id"])))
+            if row["status"] == DealStatus.WAITING_CONFIRMATION.value:
+                bot.add_view(DealConfirmView(int(row["id"])))
+
+        passes = con.execute(
+            "SELECT id,match_id,status,expires_at FROM access_passes WHERE status IN (?,?,?) ORDER BY id DESC LIMIT 500",
+            (PaymentStatus.WAITING.value, PaymentStatus.VERIFYING.value, PaymentStatus.CONFIRMED.value),
+        ).fetchall()
+        for row in passes:
+            if row["status"] in {PaymentStatus.WAITING.value, PaymentStatus.VERIFYING.value}:
+                bot.add_view(PaymentVerifyView(int(row["id"])))
+            if row["status"] == PaymentStatus.CONFIRMED.value and row["match_id"] and (row["expires_at"] or 0) > now():
+                bot.add_view(DealAccessView(int(row["match_id"])))
+    finally:
+        con.close()
+
+
 class QuickSellBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -853,7 +960,9 @@ class QuickSellBot(commands.Bot):
 
     async def setup_hook(self):
         init_db()
-        self.add_view(MainView())
+        print("[QuickSell] Registering persistent interaction views...", flush=True)
+        register_persistent_views(self)
+        print("[QuickSell] Persistent interaction views registered", flush=True)
         self.match_task = asyncio.create_task(matching_loop(self))
         try:
             await self.tree.sync()
