@@ -26,6 +26,13 @@ from discord.ext import commands
 
 DB_PATH = os.getenv("QUICKSELL_DB", "quicksell.db")
 MATCH_INTERVAL = 1.0
+# Optional: set this to a Discord channel ID in FadeHost to choose exactly where
+# the permanent QuickSell launch button is published. If empty, the bot
+# uses each server's system channel (or the first writable text channel).
+QUICKSELL_CHANNEL_ID = os.getenv("QUICKSELL_CHANNEL_ID", "").strip()
+# Public Solana wallet that receives QuickSell access payments.
+# Never put a seed phrase or private key in this file.
+QUICKSELL_PAYMENT_WALLET = "Hj142M1XAPZb8T3SiawuDyxuCt2Z8SXmKSR1CdQKLZWx"
 
 
 class RequestType(str, Enum):
@@ -220,6 +227,17 @@ async def notify_match(
             pass
 
 
+async def show_payment_wallet(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "💳 **QUICKSELL PAYMENT**\\n\\n"
+        "Send your payment to this Solana wallet:\\n"
+        f"`{QUICKSELL_PAYMENT_WALLET}`\\n\\n"
+        "⚠️ Verify the address before sending. QuickSell will only unlock access "
+        "after the payment is verified on-chain.",
+        ephemeral=True,
+    )
+
+
 class RequestModal(discord.ui.Modal):
     def __init__(self, request_type: RequestType):
         super().__init__(title="QuickSell • Create Request")
@@ -313,6 +331,15 @@ class MainView(discord.ui.View):
         await interaction.response.send_modal(RequestModal(RequestType.SELL))
 
     @discord.ui.button(
+        label="PAYMENT WALLET",
+        emoji="💳",
+        style=discord.ButtonStyle.secondary,
+        custom_id="quicksell:payment_wallet",
+    )
+    async def payment_wallet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_payment_wallet(interaction)
+
+    @discord.ui.button(
         label="MY MATCHES",
         emoji="🎯",
         style=discord.ButtonStyle.secondary,
@@ -381,32 +408,124 @@ class MainView(discord.ui.View):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+class QuickSellLaunchView(discord.ui.View):
+    """Public one-button launcher. Users do not need to type /quicksell."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="QuickSell",
+        emoji="🛒",
+        style=discord.ButtonStyle.success,
+        custom_id="quicksell:launch",
+    )
+    async def launch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "👻 **QUICKSELL**\\n\\n"
+            "Choose what you want to do:",
+            view=MainView(),
+            ephemeral=True,
+        )
+
+
 class QuickSellBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
         self.match_task: Optional[asyncio.Task] = None
+        self._published_guilds = set()
 
     async def setup_hook(self):
         init_db()
         self.add_view(MainView())
+        self.add_view(QuickSellLaunchView())
         self.match_task = asyncio.create_task(matching_loop(self))
 
-        # Keep global command synchronization explicit.
         try:
             await self.tree.sync()
         except Exception as exc:
             print(f"[QuickSell] command sync failed: {exc}")
 
+    async def _find_publish_channel(self, guild: discord.Guild):
+        if QUICKSELL_CHANNEL_ID:
+            try:
+                channel = guild.get_channel(int(QUICKSELL_CHANNEL_ID))
+                if channel and hasattr(channel, "send"):
+                    return channel
+            except (ValueError, TypeError):
+                pass
+
+        me = guild.me
+        if guild.system_channel and me:
+            if guild.system_channel.permissions_for(me).send_messages:
+                return guild.system_channel
+
+        for channel in guild.text_channels:
+            if me and channel.permissions_for(me).send_messages:
+                return channel
+
+        return None
+
+    async def _ensure_launch_button(self, guild: discord.Guild):
+        if guild.id in self._published_guilds:
+            return
+
+        channel = await self._find_publish_channel(guild)
+        if channel is None:
+            print(f"[QuickSell] no writable channel found in {guild.name}")
+            return
+
+        # Reuse an existing launcher so a restart does not create duplicates.
+        try:
+            async for message in channel.history(limit=100):
+                if message.author.id != self.user.id:
+                    continue
+                if message.embeds and any(
+                    embed.title == "👻 QuickSell" for embed in message.embeds
+                ):
+                    self._published_guilds.add(guild.id)
+                    print(
+                        f"[QuickSell] existing launch button found in "
+                        f"#{channel.name} (message={message.id})"
+                    )
+                    return
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[QuickSell] could not inspect #{channel.name}: {exc}")
+
+        embed = discord.Embed(
+            title="👻 QuickSell",
+            description=(
+                "NFT buyer/seller matching marketplace.\\n\\n"
+                "Click the button below to open QuickSell.\\n"
+                "You do **not** need to type a command."
+            ),
+        )
+
+        try:
+            message = await channel.send(
+                embed=embed,
+                view=QuickSellLaunchView(),
+            )
+            self._published_guilds.add(guild.id)
+            print(
+                f"[QuickSell] launch button published in "
+                f"#{channel.name} (message={message.id})"
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[QuickSell] could not publish in #{channel.name}: {exc}")
+
     async def on_ready(self):
         print(f"[QuickSell] connected as {self.user} (id={self.user.id})")
         print("[QuickSell] matching engine running every 1 second")
+
+        for guild in self.guilds:
+            await self._ensure_launch_button(guild)
 
 
 bot = QuickSellBot()
 
 
-@bot.tree.command(name="quicksell", description="Open the QuickSell marketplace")
+@bot.tree.command(name="quicksell", description="Open the QuickSell marketplace (fallback)")
 async def quicksell(interaction: discord.Interaction):
     await interaction.response.send_message(
         "👻 **QUICKSELL**\n\n"
