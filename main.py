@@ -29,7 +29,9 @@ MATCH_INTERVAL = 1.0
 # Optional: set this to a Discord channel ID in FadeHost to choose exactly where
 # the permanent QuickSell launch button is published. If empty, the bot
 # uses each server's system channel (or the first writable text channel).
-QUICKSELL_CHANNEL_ID = os.getenv("QUICKSELL_CHANNEL_ID", "").strip()
+QUICKSELL_CATEGORY = "🛒 QUICKSELL"
+QUICKSELL_CHANNEL = "🛒-quicksell"
+PRIVATE_MATCH_CATEGORY = "🔐 PRIVATE MATCHES"
 # Public Solana wallet that receives QuickSell access payments.
 # Never put a seed phrase or private key in this file.
 QUICKSELL_PAYMENT_WALLET = "Hj142M1XAPZb8T3SiawuDyxuCt2Z8SXmKSR1CdQKLZWx"
@@ -446,80 +448,53 @@ class QuickSellBot(commands.Bot):
         except Exception as exc:
             print(f"[QuickSell] command sync failed: {exc}")
 
-    async def _find_publish_channel(self, guild: discord.Guild):
-        if QUICKSELL_CHANNEL_ID:
-            try:
-                channel = guild.get_channel(int(QUICKSELL_CHANNEL_ID))
-                if channel and hasattr(channel, "send"):
-                    return channel
-            except (ValueError, TypeError):
-                pass
-
+    async def ensure_public_quicksell(self, guild: discord.Guild):
+        """Create/reuse ONLY the dedicated QuickSell channel. Never publish in #rules."""
         me = guild.me
-        if guild.system_channel and me:
-            if guild.system_channel.permissions_for(me).send_messages:
-                return guild.system_channel
+        if me is None:
+            print(f"[QuickSell] bot member unavailable in {guild.name}")
+            return None
 
-        for channel in guild.text_channels:
-            if me and channel.permissions_for(me).send_messages:
-                return channel
+        category = discord.utils.get(guild.categories, name=QUICKSELL_CATEGORY)
+        if category is None:
+            category = await guild.create_category(QUICKSELL_CATEGORY, reason="QuickSell public marketplace category")
+            print(f"[QuickSell] created category {QUICKSELL_CATEGORY} in {guild.name}")
 
-        return None
-
-    async def _ensure_launch_button(self, guild: discord.Guild):
-        if guild.id in self._published_guilds:
-            return
-
-        channel = await self._find_publish_channel(guild)
+        channel = discord.utils.get(category.text_channels, name=QUICKSELL_CHANNEL)
         if channel is None:
-            print(f"[QuickSell] no writable channel found in {guild.name}")
-            return
-
-        # Reuse an existing launcher so a restart does not create duplicates.
-        try:
-            async for message in channel.history(limit=100):
-                if message.author.id != self.user.id:
-                    continue
-                if message.embeds and any(
-                    embed.title == "👻 QuickSell" for embed in message.embeds
-                ):
-                    self._published_guilds.add(guild.id)
-                    print(
-                        f"[QuickSell] existing launch button found in "
-                        f"#{channel.name} (message={message.id})"
-                    )
-                    return
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            print(f"[QuickSell] could not inspect #{channel.name}: {exc}")
-
-        embed = discord.Embed(
-            title="👻 QuickSell",
-            description=(
-                "NFT buyer/seller matching marketplace.\\n\\n"
-                "Click the button below to open QuickSell.\\n"
-                "You do **not** need to type a command."
-            ),
-        )
+            channel = await guild.create_text_channel(QUICKSELL_CHANNEL, category=category, topic="QuickSell NFT buyer/seller marketplace", reason="QuickSell launcher channel")
+            print(f"[QuickSell] created #{QUICKSELL_CHANNEL} in {guild.name}")
 
         try:
-            message = await channel.send(
-                embed=embed,
-                view=QuickSellLaunchView(),
-            )
-            self._published_guilds.add(guild.id)
-            print(
-                f"[QuickSell] launch button published in "
-                f"#{channel.name} (message={message.id})"
-            )
+            await channel.set_permissions(guild.default_role, view_channel=True, read_message_history=True, send_messages=False, reason="QuickSell launcher channel")
+        except discord.HTTPException:
+            pass
+
+        try:
+            found = False
+            async for message in channel.history(limit=50):
+                if message.author.id == self.user.id and any(getattr(c, "custom_id", None) == "quicksell:launch" for row in message.components for c in row.children):
+                    found = True
+                    break
+            if not found:
+                embed = discord.Embed(title="👻 QuickSell", description="🛒 **NFT buyer/seller matching marketplace**\n\nClick the button below to open QuickSell.\nYou do **not** need to type a command.\n\n🔎 Search/matching is free.\n💬 Price differences do not block a potential match.", color=discord.Color.blurple())
+                await channel.send(embed=embed, view=QuickSellLaunchView())
+                print(f"[QuickSell] launcher published ONLY in #{QUICKSELL_CHANNEL} (guild={guild.id})")
+            else:
+                print(f"[QuickSell] launcher already exists in #{QUICKSELL_CHANNEL} (guild={guild.id})")
         except (discord.Forbidden, discord.HTTPException) as exc:
-            print(f"[QuickSell] could not publish in #{channel.name}: {exc}")
+            print(f"[QuickSell] could not publish launcher in #{QUICKSELL_CHANNEL}: {exc}")
+        return channel
 
     async def on_ready(self):
         print(f"[QuickSell] connected as {self.user} (id={self.user.id})")
         print("[QuickSell] matching engine running every 1 second")
 
         for guild in self.guilds:
-            await self._ensure_launch_button(guild)
+            try:
+                await self.ensure_public_quicksell(guild)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                print(f"[QuickSell] channel setup failed in {guild.name}: {exc}")
 
 
 bot = QuickSellBot()
