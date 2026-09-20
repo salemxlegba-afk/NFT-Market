@@ -200,8 +200,11 @@ async def verify_solana_payment(signature: str, expected_sol: float) -> tuple[st
         "getSignatureStatuses",
         [[signature], {"searchTransactionHistory": True}],
     )
-    if status_response is None:
-    return "PENDING", None
+       if status_response is None:
+        return "PENDING", None
+
+    if status_response.get("error") is not None:
+        return "INVALID", None
 
 if status_response.get("error") is not None:
     return "INVALID", None
