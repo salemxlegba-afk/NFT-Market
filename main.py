@@ -470,21 +470,70 @@ class QuickSellBot(commands.Bot):
         except discord.HTTPException:
             pass
 
+        # Remove ONLY old one-button QuickSell launchers that this bot itself
+        # previously published anywhere. The dedicated channel now contains
+        # the complete QuickSell menu directly.
+        await self.remove_old_launchers(guild, channel)
+
         try:
             found = False
             async for message in channel.history(limit=50):
-                if message.author.id == self.user.id and any(getattr(c, "custom_id", None) == "quicksell:launch" for row in message.components for c in row.children):
+                if message.author.id != self.user.id:
+                    continue
+                # The dedicated QuickSell channel must contain the full menu directly.
+                # If an old one-button launcher is still present, it is removed below.
+                has_full_menu = any(
+                    getattr(component, "custom_id", "").startswith("quicksell:")
+                    and getattr(component, "custom_id", "") != "quicksell:launch"
+                    for row in message.components
+                    for component in row.children
+                )
+                if has_full_menu:
                     found = True
                     break
             if not found:
-                embed = discord.Embed(title="👻 QuickSell", description="🛒 **NFT buyer/seller matching marketplace**\n\nClick the button below to open QuickSell.\nYou do **not** need to type a command.\n\n🔎 Search/matching is free.\n💬 Price differences do not block a potential match.", color=discord.Color.blurple())
-                await channel.send(embed=embed, view=QuickSellLaunchView())
-                print(f"[QuickSell] launcher published ONLY in #{QUICKSELL_CHANNEL} (guild={guild.id})")
+                embed = discord.Embed(
+                    title="👻 QuickSell",
+                    description=(
+                        "🛒 **NFT buyer/seller matching marketplace**\n\n"
+                        "Choose an action directly below. No extra launcher is required.\n\n"
+                        "🔎 Search/matching is free.\n"
+                        "💬 Price differences do not block a potential match.\n\n"
+                        "When you enter this channel, these are the QuickSell controls you use."
+                    ),
+                    color=discord.Color.blurple(),
+                )
+                await channel.send(embed=embed, view=MainView())
+                print(f"[QuickSell] full menu published DIRECTLY in #{QUICKSELL_CHANNEL} (guild={guild.id})")
             else:
-                print(f"[QuickSell] launcher already exists in #{QUICKSELL_CHANNEL} (guild={guild.id})")
+                print(f"[QuickSell] full menu already exists in #{QUICKSELL_CHANNEL} (guild={guild.id})")
         except (discord.Forbidden, discord.HTTPException) as exc:
             print(f"[QuickSell] could not publish launcher in #{QUICKSELL_CHANNEL}: {exc}")
         return channel
+
+    async def remove_old_launchers(self, guild: discord.Guild, target_channel: discord.TextChannel):
+        """Delete only this bot's old QuickSell launcher outside the dedicated channel."""
+        for channel in guild.text_channels:
+            try:
+                async for message in channel.history(limit=100):
+                    if message.author.id != self.user.id:
+                        continue
+                    is_launcher = any(
+                        getattr(component, "custom_id", None) == "quicksell:launch"
+                        for row in message.components
+                        for component in row.children
+                    )
+                    if not is_launcher:
+                        continue
+                    try:
+                        await message.delete(reason="Move QuickSell launcher to dedicated #🛒-quicksell")
+                        print(f"[QuickSell] removed old launcher from #{channel.name} (guild={guild.id})")
+                    except discord.Forbidden:
+                        print(f"[QuickSell] cannot delete old launcher from #{channel.name}: missing Manage Messages")
+                    except discord.HTTPException as exc:
+                        print(f"[QuickSell] could not delete old launcher from #{channel.name}: {exc}")
+            except (discord.Forbidden, discord.HTTPException):
+                continue
 
     async def on_ready(self):
         print(f"[QuickSell] connected as {self.user} (id={self.user.id})")
