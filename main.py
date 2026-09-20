@@ -45,6 +45,9 @@ PAYMENT_POLL_SECONDS = 5
 PAYMENT_MAX_AGE_SECONDS = 60 * 60 * 6
 DEAL_CHANNEL_TTL_HOURS = 48
 
+# custom_id values that identify a QuickSell menu message, wherever it is found
+QUICKSELL_MENU_CUSTOM_IDS = {"quicksell:launch", "quicksell:buy", "quicksell:sell"}
+
 
 class RequestType(str, Enum):
     BUY = "BUY"
@@ -821,9 +824,13 @@ class QuickSellBot(commands.Bot):
         me = guild.me
         if me is None:
             return None
+
+        # 1) Get or create the QuickSell category and channel.
         category = discord.utils.get(guild.categories, name=QUICKSELL_CATEGORY)
         if category is None:
             category = await guild.create_category(QUICKSELL_CATEGORY, reason="QuickSell public marketplace")
+
+        # 2) Get or create the QuickSell channel itself.
         channel = discord.utils.get(category.text_channels, name=QUICKSELL_CHANNEL)
         if channel is None:
             channel = await guild.create_text_channel(QUICKSELL_CHANNEL, category=category, topic="QuickSell NFT buyer/seller marketplace", reason="QuickSell dedicated channel")
@@ -831,7 +838,12 @@ class QuickSellBot(commands.Bot):
             await channel.set_permissions(guild.default_role, view_channel=True, read_message_history=True, send_messages=False)
         except discord.HTTPException:
             pass
-        await self.remove_old_launchers(guild)
+
+        # 3) Now that we know the correct channel id, wipe out any QuickSell menu
+        #    that exists ANYWHERE ELSE (e.g. a "rules" or "welcome" channel). This is
+        #    the hard guarantee: the buttons only ever live in #quicksell.
+        await self.remove_old_launchers(guild, keep_channel_id=channel.id)
+
         found = False
         try:
             async for message in channel.history(limit=50):
@@ -858,22 +870,28 @@ class QuickSellBot(commands.Bot):
             print(f"[QuickSell] full menu published DIRECTLY in #{QUICKSELL_CHANNEL}")
         else:
             print(f"[QuickSell] full menu already exists in #{QUICKSELL_CHANNEL}")
+
         return channel
 
-    async def remove_old_launchers(self, guild: discord.Guild):
+    async def remove_old_launchers(self, guild: discord.Guild, keep_channel_id: Optional[int] = None):
+        """Delete any QuickSell menu message found outside the designated channel
+        (e.g. leftover buttons posted in #rules, #welcome, or an old channel)."""
         for channel in guild.text_channels:
+            if keep_channel_id is not None and channel.id == keep_channel_id:
+                continue
             try:
                 async for message in channel.history(limit=100):
                     if message.author.id != self.user.id:
                         continue
-                    if any(getattr(c, "custom_id", None) == "quicksell:launch" for r in message.components for c in r.children):
+                    ids = [getattr(c, "custom_id", None) for r in message.components for c in r.children]
+                    if any(i in QUICKSELL_MENU_CUSTOM_IDS for i in ids):
                         try:
-                            await message.delete(reason="Remove obsolete QuickSell launcher")
-                            print(f"[QuickSell] removed old launcher from #{channel.name}")
+                            await message.delete(reason="QuickSell menu found outside the designated channel")
+                            print(f"[QuickSell] removed stray menu from #{channel.name}")
                         except discord.Forbidden:
-                            print(f"[QuickSell] cannot delete old launcher from #{channel.name}: missing Manage Messages")
+                            print(f"[QuickSell] cannot delete stray menu in #{channel.name}: missing Manage Messages")
                         except discord.HTTPException as exc:
-                            print(f"[QuickSell] old launcher deletion failed in #{channel.name}: {exc}")
+                            print(f"[QuickSell] deletion failed in #{channel.name}: {exc}")
             except (discord.Forbidden, discord.HTTPException):
                 continue
 
@@ -901,6 +919,16 @@ class QuickSellBot(commands.Bot):
                     await self.ensure_quicksell_invite(channel)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 print(f"[QuickSell] setup failed in {guild.name}: {exc}")
+
+    async def on_guild_join(self, guild: discord.Guild):
+        # Run the same setup the moment the bot is added to a new server,
+        # instead of waiting for the next restart.
+        try:
+            channel = await self.ensure_public_quicksell(guild)
+            if channel:
+                await self.ensure_quicksell_invite(channel)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[QuickSell] setup failed on join for {guild.name}: {exc}")
 
 
 bot = QuickSellBot()
