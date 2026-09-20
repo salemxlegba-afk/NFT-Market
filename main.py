@@ -200,24 +200,24 @@ async def verify_solana_payment(signature: str, expected_sol: float) -> tuple[st
         "getSignatureStatuses",
         [[signature], {"searchTransactionHistory": True}],
     )
-       if status_response is None:
+    # None means the RPC request itself failed/timeout: retry later.
+    if status_response is None:
         return "PENDING", None
 
+    # A JSON-RPC error is not proof of payment. Treat it as invalid input/error
+    # rather than granting access.
     if status_response.get("error") is not None:
         return "INVALID", None
 
-if status_response.get("error") is not None:
-    return "INVALID", None
     statuses = (status_response.get("result") or {}).get("value") or []
-   status = statuses[0] if statuses else None
+    status = statuses[0] if statuses else None
 
-# Aucune transaction trouvée pour cette signature
-if status is None:
-    return "INVALID", None
-
-# La transaction existe mais Solana indique une erreur
-if status.get("err") is not None:
-    return "INVALID", None
+    # RPC answered successfully but no transaction exists for this signature.
+    # This is an invalid signature/payment, not a network-pending state.
+    if status is None:
+        return "INVALID", None
+    if status.get("err") is not None:
+        return "INVALID", None
     confirmation = status.get("confirmationStatus")
     if confirmation not in {"confirmed", "finalized"}:
         return "PENDING", None
@@ -505,8 +505,8 @@ class SignatureModal(discord.ui.Modal):
             label="Solana transaction signature",
             placeholder="Paste the transaction signature",
             required=True,
-           min_length=87,
-           max_length=88,
+            min_length=87,
+            max_length=88,
         )
         self.add_item(self.signature)
 
