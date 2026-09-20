@@ -195,55 +195,87 @@ async def solana_rpc(method: str, params: list) -> Optional[dict]:
 
 
 async def verify_solana_payment(signature: str, expected_sol: float) -> tuple[str, Optional[float]]:
-    """Return (state, observed_amount). State is CONFIRMED, PENDING or INVALID."""
+    """Verify a real SOL payment to the QuickSell wallet.
+
+    Returns (CONFIRMED|PENDING|INVALID, observed_amount).
+    PENDING is reserved for temporary RPC/indexing uncertainty.
+    """
+    signature = signature.strip()
+    if not 80 <= len(signature) <= 100:
+        return "INVALID", None
+
     status_response = await solana_rpc(
         "getSignatureStatuses",
         [[signature], {"searchTransactionHistory": True}],
     )
-    # None means the RPC request itself failed/timeout: retry later.
     if status_response is None:
         return "PENDING", None
 
-    # A JSON-RPC error is not proof of payment. Treat it as invalid input/error
-    # rather than granting access.
-    if status_response.get("error") is not None:
-        return "INVALID", None
-
     statuses = (status_response.get("result") or {}).get("value") or []
     status = statuses[0] if statuses else None
-
-    # RPC answered successfully but no transaction exists for this signature.
-    # This is an invalid signature/payment, not a network-pending state.
     if status is None:
         return "INVALID", None
     if status.get("err") is not None:
         return "INVALID", None
-    confirmation = status.get("confirmationStatus")
-    if confirmation not in {"confirmed", "finalized"}:
+    if status.get("confirmationStatus") not in {"confirmed", "finalized"}:
         return "PENDING", None
 
     tx_response = await solana_rpc(
         "getTransaction",
-        [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+        [signature, {
+            "encoding": "jsonParsed",
+            "commitment": "confirmed",
+            "maxSupportedTransactionVersion": 0,
+        }],
     )
     if tx_response is None:
         return "PENDING", None
-    tx = (tx_response.get("result") or None)
+    tx = tx_response.get("result")
     if tx is None:
         return "PENDING", None
+
     meta = tx.get("meta") or {}
     if meta.get("err") is not None:
         return "INVALID", None
 
-    message = (((tx.get("transaction") or {}).get("message")) or {})
-    account_keys = message.get("accountKeys") or []
-    keys = [k.get("pubkey") if isinstance(k, dict) else k for k in account_keys]
-    pre = meta.get("preBalances") or []
-    post = meta.get("postBalances") or []
+    # Require an actual System Program SOL transfer to the configured
+    # QuickSell wallet. A mere balance increase is not enough.
+    system_program = "11111111111111111111111111111111"
     observed_lamports = 0
-    for idx, key in enumerate(keys):
-        if key == QUICKSELL_PAYMENT_WALLET and idx < len(pre) and idx < len(post):
-            observed_lamports += post[idx] - pre[idx]
+    found_transfer = False
+
+    def inspect_instructions(instructions):
+        nonlocal observed_lamports, found_transfer
+        for instruction in instructions or []:
+            if not isinstance(instruction, dict):
+                continue
+            if instruction.get("program") == "system":
+                parsed = instruction.get("parsed") or {}
+                info = parsed.get("info") or {}
+                if parsed.get("type") == "transfer" and info.get("destination") == QUICKSELL_PAYMENT_WALLET:
+                    try:
+                        lamports = int(info.get("lamports", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if lamports > 0:
+                        observed_lamports += lamports
+                        found_transfer = True
+            elif instruction.get("programId") == system_program:
+                # A partially-decoded System Program instruction cannot be
+                # safely interpreted as a transfer without decoding its data.
+                continue
+
+    message = ((tx.get("transaction") or {}).get("message") or {})
+    inspect_instructions(message.get("instructions"))
+
+    # Also inspect CPI/inner instructions, because a SOL transfer can be
+    # invoked by another program.
+    for group in meta.get("innerInstructions") or []:
+        inspect_instructions(group.get("instructions"))
+
+    if not found_transfer:
+        return "INVALID", 0.0
+
     observed_sol = observed_lamports / 1_000_000_000
     if observed_sol + 1e-9 < expected_sol:
         return "INVALID", observed_sol
@@ -505,8 +537,8 @@ class SignatureModal(discord.ui.Modal):
             label="Solana transaction signature",
             placeholder="Paste the transaction signature",
             required=True,
-            min_length=87,
-            max_length=88,
+            min_length=40,
+            max_length=100,
         )
         self.add_item(self.signature)
 
