@@ -5,9 +5,9 @@ Flow:
 1) BUY/SELL request is free.
 2) Matching runs continuously against real active requests.
 3) Price NEVER blocks a potential match.
-4) Only after a real match, contact is locked behind a 24H/48H pass.
-5) Payment is verified on-chain on Solana before access is granted.
-6) A private deal room is created for buyer + seller + bot.
+4) After a real match, both parties decide whether to proceed.
+5) After both agree, each party pays for their own 24H/48H access.
+6) Both payments are verified on-chain before the private deal room is created.
 7) Both sides must confirm the negotiated deal.
 
 Secrets are read from environment variables.
@@ -60,6 +60,7 @@ class RequestType(str, Enum):
 class DealStatus(str, Enum):
     POTENTIAL_MATCH = "POTENTIAL_MATCH"
     CONTACT_UNLOCKED = "CONTACT_UNLOCKED"
+    AGREED = "AGREED"
     WAITING_CONFIRMATION = "WAITING_CONFIRMATION"
     DEAL_CONFIRMED = "DEAL_CONFIRMED"
     DECLINED = "DECLINED"
@@ -113,6 +114,8 @@ def init_db() -> None:
             status TEXT NOT NULL,
             buyer_confirmed INTEGER NOT NULL DEFAULT 0,
             seller_confirmed INTEGER NOT NULL DEFAULT 0,
+            buyer_agreed INTEGER NOT NULL DEFAULT 0,
+            seller_agreed INTEGER NOT NULL DEFAULT 0,
             channel_id INTEGER,
             channel_name TEXT,
             created_at REAL NOT NULL,
@@ -137,6 +140,8 @@ def init_db() -> None:
     add_column_if_missing(con, "matches", "channel_id", "INTEGER")
     add_column_if_missing(con, "matches", "channel_name", "TEXT")
     add_column_if_missing(con, "matches", "closed_at", "REAL")
+    add_column_if_missing(con, "matches", "buyer_agreed", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(con, "matches", "seller_agreed", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(con, "access_passes", "match_id", "INTEGER")
     add_column_if_missing(con, "access_passes", "expected_sol", "REAL")
     add_column_if_missing(con, "access_passes", "created_at", "REAL")
@@ -250,33 +255,23 @@ async def notify_match(bot: commands.Bot, match_id: int, buy: sqlite3.Row, sell:
     buyer = bot.get_user(buy["user_id"]) or await safe_fetch_user(bot, buy["user_id"])
     seller = bot.get_user(sell["user_id"]) or await safe_fetch_user(bot, sell["user_id"])
     buyer_text = (
-        "🎯 **INTERESTED SELLER FOUND**\n\n"
-        f"Collection: **{buy['collection']}**\n"
-        f"Seller asking price: **{format_sol(sell['amount'])}**\n"
-        f"Your offer/budget: **{format_sol(buy['amount'])}**\n\n"
-        "💬 The price can be negotiated directly.\n"
-        "🔒 Contact is unlocked only after the access pass is verified.\n\n"
-        f"Match ID: **#{match_id}**"
+        "🎯 **POTENTIAL MATCH FOUND**\n\nA real seller matching your request is available.\n\n"
+        f"Collection: **{buy['collection']}**\nSeller asking price: **{format_sol(sell['amount'])} SOL**\nYour offer/budget: **{format_sol(buy['amount'])} SOL**\n\n"
+        "💬 The price can be negotiated directly.\n\nDo you want to proceed with this potential deal?\n\n"
+        "⚠️ No payment is requested yet. First, both parties must agree to proceed."
     )
     seller_text = (
-        "🎯 **INTERESTED BUYER FOUND**\n\n"
-        f"Collection: **{sell['collection']}**\n"
-        f"Your asking price: **{format_sol(sell['amount'])}**\n"
-        f"Buyer offer: **{format_sol(buy['amount'])}**\n\n"
-        "💬 The price can be negotiated directly.\n"
-        "🔒 Contact is unlocked only after the access pass is verified.\n\n"
-        f"Match ID: **#{match_id}**"
+        "🎯 **POTENTIAL MATCH FOUND**\n\nA real buyer matching your listing is available.\n\n"
+        f"Collection: **{sell['collection']}**\nYour asking price: **{format_sol(sell['amount'])} SOL**\nBuyer offer: **{format_sol(buy['amount'])} SOL**\n\n"
+        "💬 The price can be negotiated directly.\n\nDo you want to proceed with this potential deal?\n\n"
+        "⚠️ No payment is requested yet. First, both parties must agree to proceed."
     )
     if buyer:
-        try:
-            await buyer.send(buyer_text, view=MatchContactView(match_id))
-        except discord.HTTPException:
-            pass
+        try: await buyer.send(buyer_text, view=MatchAgreementView(match_id))
+        except discord.HTTPException: pass
     if seller:
-        try:
-            await seller.send(seller_text, view=MatchContactView(match_id))
-        except discord.HTTPException:
-            pass
+        try: await seller.send(seller_text, view=MatchAgreementView(match_id))
+        except discord.HTTPException: pass
 
 
 async def safe_fetch_user(bot: commands.Bot, user_id: int):
@@ -366,32 +361,88 @@ class RequestModal(discord.ui.Modal):
         )
 
 
-class MatchContactView(discord.ui.View):
+class MatchAgreementView(discord.ui.View):
     def __init__(self, match_id: int):
-        super().__init__(timeout=24 * 60 * 60)
-        self.match_id = match_id
+        super().__init__(timeout=24 * 60 * 60); self.match_id = match_id
+    @discord.ui.button(label="I AGREE TO PROCEED", emoji="🤝", style=discord.ButtonStyle.success)
+    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await record_match_agreement(interaction, self.match_id, True)
+    @discord.ui.button(label="I DON'T AGREE", emoji="❌", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await record_match_agreement(interaction, self.match_id, False)
 
-    @discord.ui.button(label="Contact Interested Party", emoji="📩", style=discord.ButtonStyle.success)
-    async def contact(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_contact(interaction, self.match_id)
+
+async def record_match_agreement(interaction: discord.Interaction, match_id: int, agree: bool):
+    match = get_match_for_user(interaction.user.id, match_id)
+    if not match:
+        await interaction.response.send_message("❌ This match is not available to you.", ephemeral=True); return
+    if match["status"] in {DealStatus.DECLINED.value, DealStatus.CLOSED.value, DealStatus.DEAL_CONFIRMED.value}:
+        await interaction.response.send_message("❌ This match is already closed.", ephemeral=True); return
+    con=db()
+    if not agree:
+        con.execute("UPDATE matches SET status=?,closed_at=? WHERE id=?", (DealStatus.DECLINED.value, now(), match_id)); con.commit(); con.close()
+        await interaction.response.send_message("❌ You chose not to proceed. This potential match has been closed. No payment was requested.", ephemeral=True)
+        other_id=match["seller_id"] if interaction.user.id==match["buyer_id"] else match["buyer_id"]
+        other=interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
+        if other:
+            try: await other.send("❌ The other party decided not to proceed with this potential match. No payment was requested.")
+            except discord.HTTPException: pass
+        return
+    if interaction.user.id==match["buyer_id"]: con.execute("UPDATE matches SET buyer_agreed=1 WHERE id=?",(match_id,))
+    else: con.execute("UPDATE matches SET seller_agreed=1 WHERE id=?",(match_id,))
+    con.commit(); row=con.execute("SELECT buyer_agreed,seller_agreed FROM matches WHERE id=?",(match_id,)).fetchone()
+    if row["buyer_agreed"] and row["seller_agreed"]:
+        con.execute("UPDATE matches SET status=? WHERE id=?",(DealStatus.AGREED.value,match_id)); con.commit(); con.close()
+        await interaction.response.send_message("🎉 **BOTH PARTIES AGREED**\n\nBoth sides are ready to proceed. Each party must now activate and pay for their own 24H or 48H access. The private deal room will be created automatically after both payments are confirmed on-chain.", ephemeral=True)
+        await send_access_options(interaction.client, match_id, match)
+        return
+    con.close()
+    await interaction.response.send_message("✅ **You are ready to proceed.**\n\nThe other party has been notified. No payment is requested until both sides agree.", ephemeral=True)
+    other_id=match["seller_id"] if interaction.user.id==match["buyer_id"] else match["buyer_id"]
+    other=interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
+    if other:
+        try: await other.send("🔔 **The other party is ready to proceed!**\n\nThey have agreed to continue with this potential deal. Please choose **I AGREE TO PROCEED** or **I DON'T AGREE**.\n\n⚠️ No payment is requested until both sides agree.", view=MatchAgreementView(match_id))
+        except discord.HTTPException: pass
+
+
+async def send_access_options(bot: commands.Bot, match_id: int, match: sqlite3.Row):
+    buyer=bot.get_user(match["buyer_id"]) or await safe_fetch_user(bot,match["buyer_id"])
+    seller=bot.get_user(match["seller_id"]) or await safe_fetch_user(bot,match["seller_id"])
+    p24=plan_price(24); p48=plan_price(48)
+    embed=discord.Embed(title="🔓 BOTH PARTIES ARE READY", description=(
+        "Both buyer and seller agreed to proceed.\n\n"
+        f"⚡ **24H access:** {format_sol(p24) if p24 is not None else 'not configured'}\n"
+        f"🚀 **48H access:** {format_sol(p48) if p48 is not None else 'not configured'}\n\n"
+        "Each party pays for their own access. The private deal room is created automatically only after both payments are confirmed on-chain."), color=discord.Color.blurple())
+    for user in (buyer,seller):
+        if user:
+            try: await user.send(embed=embed,view=AccessPlanView(match_id))
+            except discord.HTTPException: pass
 
 
 async def handle_contact(interaction: discord.Interaction, match_id: int):
-    match = get_match_for_user(interaction.user.id, match_id)
+    match=get_match_for_user(interaction.user.id,match_id)
     if not match:
-        await interaction.response.send_message("❌ This match is not available to you.", ephemeral=True)
-        return
-    if match["status"] in {DealStatus.DECLINED.value, DealStatus.CLOSED.value, DealStatus.DEAL_CONFIRMED.value}:
-        await interaction.response.send_message("❌ This match is already closed.", ephemeral=True)
-        return
-    if has_active_pass(interaction.user.id, match_id):
-        await unlock_contact(interaction, match_id)
-        return
-    await interaction.response.send_message(
-        embed=access_embed(match),
-        view=AccessPlanView(match_id),
-        ephemeral=True,
-    )
+        await interaction.response.send_message("❌ This match is not available to you.",ephemeral=True); return
+    if match["status"] in {DealStatus.DECLINED.value,DealStatus.CLOSED.value,DealStatus.DEAL_CONFIRMED.value}:
+        await interaction.response.send_message("❌ This match is already closed.",ephemeral=True); return
+    await interaction.response.send_message(embed=agreement_embed(match),view=MatchAgreementView(match_id),ephemeral=True)
+
+
+def agreement_embed(match: sqlite3.Row) -> discord.Embed:
+    p24=plan_price(24); p48=plan_price(48)
+    return discord.Embed(title="🎯 POTENTIAL MATCH FOUND",description=(
+        "A real potential match has been found.\n\n"
+        f"Collection: **{match['collection']}**\n"
+        f"Seller asking price: **{format_sol(match['seller_asking'])} SOL**\n"
+        f"Buyer offer: **{format_sol(match['buyer_offer'])} SOL**\n\n"
+        "💬 The price can be negotiated directly.\n\n"
+        "Do you want to proceed with this potential deal?\n\n"
+        f"⚡ 24H access: **{format_sol(p24) if p24 is not None else 'not configured'}**\n"
+        f"🚀 48H access: **{format_sol(p48) if p48 is not None else 'not configured'}**\n\n"
+        "These are access prices only; payment is requested only after BOTH parties agree."),color=discord.Color.gold())
+
+
 
 
 def get_match_for_user(user_id: int, match_id: int) -> Optional[sqlite3.Row]:
@@ -465,6 +516,12 @@ async def start_payment(interaction: discord.Interaction, match_id: int, hours: 
     match = get_match_for_user(interaction.user.id, match_id)
     if not match:
         await interaction.response.send_message("❌ This match is not available to you.", ephemeral=True)
+        return
+    if not (match["buyer_agreed"] and match["seller_agreed"]):
+        await interaction.response.send_message("⏳ Both parties must agree to proceed before payment is requested.", ephemeral=True)
+        return
+    if has_active_pass(interaction.user.id, match_id):
+        await interaction.response.send_message("✅ Your access payment is already confirmed for this match. Waiting for the other party if necessary.", ephemeral=True)
         return
     con = db()
     cur = con.execute(
@@ -567,62 +624,36 @@ async def verify_and_apply_payment(interaction: discord.Interaction, pass_id: in
     state, observed = await verify_solana_payment(signature, row["expected_sol"])
     con = db()
     if state == "CONFIRMED":
-        confirmed = now()
-        expires = confirmed + row["plan_hours"] * 3600
-        con.execute(
-            "UPDATE access_passes SET status='CONFIRMED',confirmed_at=?,expires_at=? WHERE id=? AND status='VERIFYING'",
-            (confirmed, expires, pass_id),
-        )
-        con.execute(
-            "UPDATE matches SET status=? WHERE id=? AND status=?",
-            (DealStatus.CONTACT_UNLOCKED.value, row["match_id"], DealStatus.POTENTIAL_MATCH.value),
-        )
-        con.commit()
-        con.close()
-        # Automatically create the private deal room as soon as payment is confirmed.
-        # The user must NOT have to search My Matches or click another button to find it.
-        try:
-            match = get_match_for_user(interaction.user.id, row["match_id"])
-            channel = None
-            if match and interaction.guild and interaction.guild.id == match["guild_id"]:
-                channel = await ensure_deal_channel(interaction.guild, match)
-
-            if channel is not None:
-                await interaction.followup.send(
-                    f"✅ **Payment confirmed on-chain.**\n\n"
-                    f"Access: **{row['plan_hours']}H**\n"
-                    f"Expires: <t:{int(expires)}:F>\n\n"
-                    f"🤝 **Your private deal room is ready.**\n"
-                    f"Go directly here: {channel.mention}\n\n"
-                    "The buyer and seller can now negotiate. Both sides must confirm the final deal.",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.followup.send(
-                    f"✅ **Payment confirmed on-chain.**\n\n"
-                    f"Access: **{row['plan_hours']}H**\n"
-                    f"Expires: <t:{int(expires)}:F>\n\n"
-                    "⚠️ The private deal room could not be created automatically. Please stay in the QuickSell server and retry from your match.",
-                    ephemeral=True,
-                )
-        except discord.HTTPException:
-            pass
+        confirmed=now(); expires=confirmed+row["plan_hours"]*3600
+        con.execute("UPDATE access_passes SET status='CONFIRMED',confirmed_at=?,expires_at=? WHERE id=? AND status='VERIFYING'",(confirmed,expires,pass_id)); con.commit(); con.close()
+        match=get_match_for_user(interaction.user.id,row["match_id"])
+        if not match:
+            await interaction.followup.send("❌ Match not found after payment verification.",ephemeral=True); return "CONFIRMED"
+        both_paid=has_active_pass(match["buyer_id"],row["match_id"]) and has_active_pass(match["seller_id"],row["match_id"])
+        other_id=match["seller_id"] if interaction.user.id==match["buyer_id"] else match["buyer_id"]
+        other=interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client,other_id)
+        if not both_paid:
+            await interaction.followup.send(f"✅ **Payment confirmed on-chain.**\n\nAccess: **{row['plan_hours']}H**\nExpires: <t:{int(expires)}:F>\n\n⏳ **Waiting for the other party to activate their access.**\nThe private deal room will be created automatically as soon as both payments are confirmed.",ephemeral=True)
+            if other:
+                try: await other.send("🔔 **The other party has activated their access.**\n\nYour payment is still pending. Complete your 24H or 48H access payment to unlock the private deal room automatically.",view=AccessPlanView(row["match_id"]))
+                except discord.HTTPException: pass
+            return "CONFIRMED"
+        con=db(); con.execute("UPDATE matches SET status=? WHERE id=?",(DealStatus.CONTACT_UNLOCKED.value,row["match_id"])); con.commit(); con.close()
+        guild=interaction.client.get_guild(match["guild_id"])
+        if guild is None:
+            try: guild=await interaction.client.fetch_guild(match["guild_id"])
+            except discord.HTTPException: guild=None
+        channel=await ensure_deal_channel(guild,match) if guild else None
+        if channel:
+            await interaction.followup.send(f"🎉 **BOTH ACCESS PAYMENTS CONFIRMED.**\n\nYour access: **{row['plan_hours']}H**\nExpires: <t:{int(expires)}:F>\n\n🤝 **Private deal room created automatically:** {channel.mention}",ephemeral=True)
+        else:
+            await interaction.followup.send("✅ **Payment confirmed on-chain.** Both parties have paid, but the private room could not be created automatically. Check the bot's Manage Channels/Manage Permissions permissions.",ephemeral=True)
         return "CONFIRMED"
     if state == "INVALID":
         con.execute("UPDATE access_passes SET status='FAILED' WHERE id=?", (pass_id,))
         con.commit()
     con.close()
     return state
-
-
-class DealAccessView(discord.ui.View):
-    def __init__(self, match_id: int):
-        super().__init__(timeout=24 * 60 * 60)
-        self.match_id = match_id
-
-    @discord.ui.button(label="📩 Open Private Deal Room", style=discord.ButtonStyle.success)
-    async def open_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await unlock_contact(interaction, self.match_id)
 
 
 async def unlock_contact(interaction: discord.Interaction, match_id: int):
@@ -654,7 +685,10 @@ def match_users(match: sqlite3.Row) -> tuple[int, int]:
 
 
 async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
-    existing = guild.get_channel(match["channel_id"]) if match["channel_id"] else None
+    if guild is None: return None
+    con=db(); fresh=con.execute("""SELECT m.*, b.user_id buyer_id, b.collection, b.mint, b.amount buyer_offer, b.guild_id, s.user_id seller_id, s.amount seller_asking FROM matches m JOIN requests b ON b.id=m.buy_request_id JOIN requests s ON s.id=m.sell_request_id WHERE m.id=?""",(match["id"],)).fetchone(); con.close()
+    if fresh: match=fresh
+    existing=guild.get_channel(match["channel_id"]) if match["channel_id"] else None
     if isinstance(existing, discord.TextChannel):
         return existing
     category = discord.utils.get(guild.categories, name=PRIVATE_MATCH_CATEGORY)
@@ -798,10 +832,10 @@ class MainView(discord.ui.View):
             "1. BUY or SELL is free.\n"
             "2. QuickSell checks real active requests continuously.\n"
             "3. Matching uses collection/mint compatibility; price does not block the match.\n"
-            "4. After a real potential match, contact is locked.\n"
-            "5. A 24H or 48H pass is verified on-chain before contact is unlocked.\n"
-            "6. Buyer and seller negotiate privately.\n"
-            "7. Both must confirm the final deal for DEAL_CONFIRMED.\n\n"
+            "4. After a real potential match, both parties decide whether to proceed.\n"
+            "5. Only after both agree, each party chooses and pays for their own 24H or 48H access.\n"
+            "6. The private deal room is created automatically after both payments are verified on-chain.\n"
+            "7. Buyer and seller negotiate privately and both confirm the final deal.\n\n"
             "QuickSell connects the parties; it does not guarantee the NFT transfer or payment between them.",
             ephemeral=True,
         )
