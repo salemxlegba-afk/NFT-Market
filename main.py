@@ -5,9 +5,9 @@ Flow:
 1) BUY/SELL request is free.
 2) Matching runs continuously against real active requests.
 3) Price NEVER blocks a potential match.
-4) After a real match, both parties decide whether to proceed.
-5) After both agree, each party pays for their own 24H/48H access.
-6) Both payments are verified on-chain before the private deal room is created.
+4) Only after a real match, contact is locked behind a 24H/48H pass.
+5) Payment is verified on-chain on Solana before access is granted.
+6) A private deal room is created for buyer + seller + bot.
 7) Both sides must confirm the negotiated deal.
 
 Secrets are read from environment variables.
@@ -34,19 +34,13 @@ MATCH_INTERVAL = 1.0
 QUICKSELL_CATEGORY = "🛒 QUICKSELL"
 QUICKSELL_CHANNEL = "🛒-quicksell"
 PRIVATE_MATCH_CATEGORY = "🔐 PRIVATE MATCHES"
-QUICKSELL_NETWORK = os.getenv("QUICKSELL_NETWORK", "devnet").strip().lower()
-DEVNET_PAYMENT_WALLET = "GuMirVy1WXGL8R1s15N1T7Dj5kANnyNHWGMbsMXHutde"
-MAINNET_PAYMENT_WALLET = "Hj142M1XAPZb8T3SiawuDyxuCt2Z8SXmKSR1CdQKLZWx"
-if QUICKSELL_NETWORK == "devnet":
-    QUICKSELL_RPC_URL = os.getenv("QUICKSELL_RPC_URL", "https://api.devnet.solana.com")
-    QUICKSELL_PAYMENT_WALLET = os.getenv("QUICKSELL_PAYMENT_WALLET", DEVNET_PAYMENT_WALLET)
-    PASS_24H_SOL = os.getenv("QUICKSELL_24H_SOL", "0.01")
-    PASS_48H_SOL = os.getenv("QUICKSELL_48H_SOL", "0.01")
-else:
-    QUICKSELL_RPC_URL = os.getenv("QUICKSELL_RPC_URL", "https://api.mainnet-beta.solana.com")
-    QUICKSELL_PAYMENT_WALLET = os.getenv("QUICKSELL_PAYMENT_WALLET", MAINNET_PAYMENT_WALLET)
-    PASS_24H_SOL = os.getenv("QUICKSELL_24H_SOL")
-    PASS_48H_SOL = os.getenv("QUICKSELL_48H_SOL")
+QUICKSELL_PAYMENT_WALLET = os.getenv(
+    "QUICKSELL_PAYMENT_WALLET",
+    "Hj142M1XAPZb8T3SiawuDyxuCt2Z8SXmKSR1CdQKLZWx",
+)
+QUICKSELL_RPC_URL = os.getenv("QUICKSELL_RPC_URL", "https://api.mainnet-beta.solana.com")
+PASS_24H_SOL = os.getenv("QUICKSELL_24H_SOL")
+PASS_48H_SOL = os.getenv("QUICKSELL_48H_SOL")
 PAYMENT_POLL_SECONDS = 5
 PAYMENT_MAX_AGE_SECONDS = 60 * 60 * 6
 DEAL_CHANNEL_TTL_HOURS = 48
@@ -60,7 +54,6 @@ class RequestType(str, Enum):
 class DealStatus(str, Enum):
     POTENTIAL_MATCH = "POTENTIAL_MATCH"
     CONTACT_UNLOCKED = "CONTACT_UNLOCKED"
-    AGREED = "AGREED"
     WAITING_CONFIRMATION = "WAITING_CONFIRMATION"
     DEAL_CONFIRMED = "DEAL_CONFIRMED"
     DECLINED = "DECLINED"
@@ -114,8 +107,6 @@ def init_db() -> None:
             status TEXT NOT NULL,
             buyer_confirmed INTEGER NOT NULL DEFAULT 0,
             seller_confirmed INTEGER NOT NULL DEFAULT 0,
-            buyer_agreed INTEGER NOT NULL DEFAULT 0,
-            seller_agreed INTEGER NOT NULL DEFAULT 0,
             channel_id INTEGER,
             channel_name TEXT,
             created_at REAL NOT NULL,
@@ -140,8 +131,6 @@ def init_db() -> None:
     add_column_if_missing(con, "matches", "channel_id", "INTEGER")
     add_column_if_missing(con, "matches", "channel_name", "TEXT")
     add_column_if_missing(con, "matches", "closed_at", "REAL")
-    add_column_if_missing(con, "matches", "buyer_agreed", "INTEGER NOT NULL DEFAULT 0")
-    add_column_if_missing(con, "matches", "seller_agreed", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(con, "access_passes", "match_id", "INTEGER")
     add_column_if_missing(con, "access_passes", "expected_sol", "REAL")
     add_column_if_missing(con, "access_passes", "created_at", "REAL")
@@ -255,23 +244,33 @@ async def notify_match(bot: commands.Bot, match_id: int, buy: sqlite3.Row, sell:
     buyer = bot.get_user(buy["user_id"]) or await safe_fetch_user(bot, buy["user_id"])
     seller = bot.get_user(sell["user_id"]) or await safe_fetch_user(bot, sell["user_id"])
     buyer_text = (
-        "🎯 **POTENTIAL MATCH FOUND**\n\nA real seller matching your request is available.\n\n"
-        f"Collection: **{buy['collection']}**\nSeller asking price: **{format_sol(sell['amount'])} SOL**\nYour offer/budget: **{format_sol(buy['amount'])} SOL**\n\n"
-        "💬 The price can be negotiated directly.\n\nDo you want to proceed with this potential deal?\n\n"
-        "⚠️ No payment is requested yet. First, both parties must agree to proceed."
+        "🎯 **INTERESTED SELLER FOUND**\n\n"
+        f"Collection: **{buy['collection']}**\n"
+        f"Seller asking price: **{format_sol(sell['amount'])}**\n"
+        f"Your offer/budget: **{format_sol(buy['amount'])}**\n\n"
+        "💬 The price can be negotiated directly.\n"
+        "🔒 Contact is unlocked only after the access pass is verified.\n\n"
+        f"Match ID: **#{match_id}**"
     )
     seller_text = (
-        "🎯 **POTENTIAL MATCH FOUND**\n\nA real buyer matching your listing is available.\n\n"
-        f"Collection: **{sell['collection']}**\nYour asking price: **{format_sol(sell['amount'])} SOL**\nBuyer offer: **{format_sol(buy['amount'])} SOL**\n\n"
-        "💬 The price can be negotiated directly.\n\nDo you want to proceed with this potential deal?\n\n"
-        "⚠️ No payment is requested yet. First, both parties must agree to proceed."
+        "🎯 **INTERESTED BUYER FOUND**\n\n"
+        f"Collection: **{sell['collection']}**\n"
+        f"Your asking price: **{format_sol(sell['amount'])}**\n"
+        f"Buyer offer: **{format_sol(buy['amount'])}**\n\n"
+        "💬 The price can be negotiated directly.\n"
+        "🔒 Contact is unlocked only after the access pass is verified.\n\n"
+        f"Match ID: **#{match_id}**"
     )
     if buyer:
-        try: await buyer.send(buyer_text, view=MatchAgreementView(match_id))
-        except discord.HTTPException: pass
+        try:
+            await buyer.send(buyer_text, view=MatchContactView(match_id))
+        except discord.HTTPException:
+            pass
     if seller:
-        try: await seller.send(seller_text, view=MatchAgreementView(match_id))
-        except discord.HTTPException: pass
+        try:
+            await seller.send(seller_text, view=MatchContactView(match_id))
+        except discord.HTTPException:
+            pass
 
 
 async def safe_fetch_user(bot: commands.Bot, user_id: int):
@@ -361,88 +360,32 @@ class RequestModal(discord.ui.Modal):
         )
 
 
-class MatchAgreementView(discord.ui.View):
+class MatchContactView(discord.ui.View):
     def __init__(self, match_id: int):
-        super().__init__(timeout=24 * 60 * 60); self.match_id = match_id
-    @discord.ui.button(label="I AGREE TO PROCEED", emoji="🤝", style=discord.ButtonStyle.success)
-    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await record_match_agreement(interaction, self.match_id, True)
-    @discord.ui.button(label="I DON'T AGREE", emoji="❌", style=discord.ButtonStyle.danger)
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await record_match_agreement(interaction, self.match_id, False)
+        super().__init__(timeout=24 * 60 * 60)
+        self.match_id = match_id
 
-
-async def record_match_agreement(interaction: discord.Interaction, match_id: int, agree: bool):
-    match = get_match_for_user(interaction.user.id, match_id)
-    if not match:
-        await interaction.response.send_message("❌ This match is not available to you.", ephemeral=True); return
-    if match["status"] in {DealStatus.DECLINED.value, DealStatus.CLOSED.value, DealStatus.DEAL_CONFIRMED.value}:
-        await interaction.response.send_message("❌ This match is already closed.", ephemeral=True); return
-    con=db()
-    if not agree:
-        con.execute("UPDATE matches SET status=?,closed_at=? WHERE id=?", (DealStatus.DECLINED.value, now(), match_id)); con.commit(); con.close()
-        await interaction.response.send_message("❌ You chose not to proceed. This potential match has been closed. No payment was requested.", ephemeral=True)
-        other_id=match["seller_id"] if interaction.user.id==match["buyer_id"] else match["buyer_id"]
-        other=interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
-        if other:
-            try: await other.send("❌ The other party decided not to proceed with this potential match. No payment was requested.")
-            except discord.HTTPException: pass
-        return
-    if interaction.user.id==match["buyer_id"]: con.execute("UPDATE matches SET buyer_agreed=1 WHERE id=?",(match_id,))
-    else: con.execute("UPDATE matches SET seller_agreed=1 WHERE id=?",(match_id,))
-    con.commit(); row=con.execute("SELECT buyer_agreed,seller_agreed FROM matches WHERE id=?",(match_id,)).fetchone()
-    if row["buyer_agreed"] and row["seller_agreed"]:
-        con.execute("UPDATE matches SET status=? WHERE id=?",(DealStatus.AGREED.value,match_id)); con.commit(); con.close()
-        await interaction.response.send_message("🎉 **BOTH PARTIES AGREED**\n\nBoth sides are ready to proceed. Each party must now activate and pay for their own 24H or 48H access. The private deal room will be created automatically after both payments are confirmed on-chain.", ephemeral=True)
-        await send_access_options(interaction.client, match_id, match)
-        return
-    con.close()
-    await interaction.response.send_message("✅ **You are ready to proceed.**\n\nThe other party has been notified. No payment is requested until both sides agree.", ephemeral=True)
-    other_id=match["seller_id"] if interaction.user.id==match["buyer_id"] else match["buyer_id"]
-    other=interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
-    if other:
-        try: await other.send("🔔 **The other party is ready to proceed!**\n\nThey have agreed to continue with this potential deal. Please choose **I AGREE TO PROCEED** or **I DON'T AGREE**.\n\n⚠️ No payment is requested until both sides agree.", view=MatchAgreementView(match_id))
-        except discord.HTTPException: pass
-
-
-async def send_access_options(bot: commands.Bot, match_id: int, match: sqlite3.Row):
-    buyer=bot.get_user(match["buyer_id"]) or await safe_fetch_user(bot,match["buyer_id"])
-    seller=bot.get_user(match["seller_id"]) or await safe_fetch_user(bot,match["seller_id"])
-    p24=plan_price(24); p48=plan_price(48)
-    embed=discord.Embed(title="🔓 BOTH PARTIES ARE READY", description=(
-        "Both buyer and seller agreed to proceed.\n\n"
-        f"⚡ **24H access:** {format_sol(p24) if p24 is not None else 'not configured'}\n"
-        f"🚀 **48H access:** {format_sol(p48) if p48 is not None else 'not configured'}\n\n"
-        "Each party pays for their own access. The private deal room is created automatically only after both payments are confirmed on-chain."), color=discord.Color.blurple())
-    for user in (buyer,seller):
-        if user:
-            try: await user.send(embed=embed,view=AccessPlanView(match_id))
-            except discord.HTTPException: pass
+    @discord.ui.button(label="Contact Interested Party", emoji="📩", style=discord.ButtonStyle.success)
+    async def contact(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_contact(interaction, self.match_id)
 
 
 async def handle_contact(interaction: discord.Interaction, match_id: int):
-    match=get_match_for_user(interaction.user.id,match_id)
+    match = get_match_for_user(interaction.user.id, match_id)
     if not match:
-        await interaction.response.send_message("❌ This match is not available to you.",ephemeral=True); return
-    if match["status"] in {DealStatus.DECLINED.value,DealStatus.CLOSED.value,DealStatus.DEAL_CONFIRMED.value}:
-        await interaction.response.send_message("❌ This match is already closed.",ephemeral=True); return
-    await interaction.response.send_message(embed=agreement_embed(match),view=MatchAgreementView(match_id),ephemeral=True)
-
-
-def agreement_embed(match: sqlite3.Row) -> discord.Embed:
-    p24=plan_price(24); p48=plan_price(48)
-    return discord.Embed(title="🎯 POTENTIAL MATCH FOUND",description=(
-        "A real potential match has been found.\n\n"
-        f"Collection: **{match['collection']}**\n"
-        f"Seller asking price: **{format_sol(match['seller_asking'])} SOL**\n"
-        f"Buyer offer: **{format_sol(match['buyer_offer'])} SOL**\n\n"
-        "💬 The price can be negotiated directly.\n\n"
-        "Do you want to proceed with this potential deal?\n\n"
-        f"⚡ 24H access: **{format_sol(p24) if p24 is not None else 'not configured'}**\n"
-        f"🚀 48H access: **{format_sol(p48) if p48 is not None else 'not configured'}**\n\n"
-        "These are access prices only; payment is requested only after BOTH parties agree."),color=discord.Color.gold())
-
-
+        await interaction.response.send_message("❌ This match is not available to you.", ephemeral=True)
+        return
+    if match["status"] in {DealStatus.DECLINED.value, DealStatus.CLOSED.value, DealStatus.DEAL_CONFIRMED.value}:
+        await interaction.response.send_message("❌ This match is already closed.", ephemeral=True)
+        return
+    if has_active_pass(interaction.user.id, match_id):
+        await unlock_contact(interaction, match_id)
+        return
+    await interaction.response.send_message(
+        embed=access_embed(match),
+        view=AccessPlanView(match_id),
+        ephemeral=True,
+    )
 
 
 def get_match_for_user(user_id: int, match_id: int) -> Optional[sqlite3.Row]:
@@ -517,12 +460,6 @@ async def start_payment(interaction: discord.Interaction, match_id: int, hours: 
     if not match:
         await interaction.response.send_message("❌ This match is not available to you.", ephemeral=True)
         return
-    if not (match["buyer_agreed"] and match["seller_agreed"]):
-        await interaction.response.send_message("⏳ Both parties must agree to proceed before payment is requested.", ephemeral=True)
-        return
-    if has_active_pass(interaction.user.id, match_id):
-        await interaction.response.send_message("✅ Your access payment is already confirmed for this match. Waiting for the other party if necessary.", ephemeral=True)
-        return
     con = db()
     cur = con.execute(
         "INSERT INTO access_passes (user_id,match_id,plan_hours,expected_sol,status,created_at) VALUES (?,?,?,?,?,?)",
@@ -536,7 +473,6 @@ async def start_payment(interaction: discord.Interaction, match_id: int, hours: 
             title=f"💳 {hours}H QuickSell Access",
             description=(
                 f"Amount to send: **{format_sol(amount)}**\n\n"
-                f"Network: **{QUICKSELL_NETWORK.upper()}**\n"
                 f"Solana wallet:\n`{QUICKSELL_PAYMENT_WALLET}`\n\n"
                 "1. Send the exact amount on Solana.\n"
                 "2. Copy the transaction signature.\n"
@@ -624,65 +560,42 @@ async def verify_and_apply_payment(interaction: discord.Interaction, pass_id: in
     state, observed = await verify_solana_payment(signature, row["expected_sol"])
     con = db()
     if state == "CONFIRMED":
-        confirmed=now(); expires=confirmed+row["plan_hours"]*3600
-        con.execute("UPDATE access_passes SET status='CONFIRMED',confirmed_at=?,expires_at=? WHERE id=? AND status='VERIFYING'",(confirmed,expires,pass_id)); con.commit(); con.close()
-        match=get_match_for_user(interaction.user.id,row["match_id"])
-        if not match:
-            await interaction.followup.send("❌ Match not found after payment verification.",ephemeral=True); return "CONFIRMED"
-        both_paid=has_active_pass(match["buyer_id"],row["match_id"]) and has_active_pass(match["seller_id"],row["match_id"])
-        other_id=match["seller_id"] if interaction.user.id==match["buyer_id"] else match["buyer_id"]
-        other=interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client,other_id)
-        if not both_paid:
-            await interaction.followup.send(f"✅ **Payment confirmed on-chain.**\n\nAccess: **{row['plan_hours']}H**\nExpires: <t:{int(expires)}:F>\n\n⏳ **Waiting for the other party to activate their access.**\nThe private deal room will be created automatically as soon as both payments are confirmed.",ephemeral=True)
-            if other:
-                try: await other.send("🔔 **The other party has activated their access.**\n\nYour payment is still pending. Complete your 24H or 48H access payment to unlock the private deal room automatically.",view=AccessPlanView(row["match_id"]))
-                except discord.HTTPException: pass
-            return "CONFIRMED"
-        con=db(); con.execute("UPDATE matches SET status=? WHERE id=?",(DealStatus.CONTACT_UNLOCKED.value,row["match_id"])); con.commit(); con.close()
-        guild=interaction.client.get_guild(match["guild_id"])
-        if guild is None:
-            try: guild=await interaction.client.fetch_guild(match["guild_id"])
-            except discord.HTTPException: guild=None
-        channel=await ensure_deal_channel(guild,match) if guild else None
-        if channel:
-            # Notify the payer immediately (ephemeral confirmation).
+        confirmed = now()
+        expires = confirmed + row["plan_hours"] * 3600
+        con.execute(
+            "UPDATE access_passes SET status='CONFIRMED',confirmed_at=?,expires_at=? WHERE id=? AND status='VERIFYING'",
+            (confirmed, expires, pass_id),
+        )
+        con.execute(
+            "UPDATE matches SET status=? WHERE id=? AND status=?",
+            (DealStatus.CONTACT_UNLOCKED.value, row["match_id"], DealStatus.POTENTIAL_MATCH.value),
+        )
+        con.commit()
+        con.close()
+        try:
             await interaction.followup.send(
-                f"🎉 **BOTH ACCESS PAYMENTS CONFIRMED.**\n\n"
-                f"Your access: **{row['plan_hours']}H**\n"
-                f"Expires: <t:{int(expires)}:F>\n\n"
-                f"🤝 **Private deal room created automatically:** {channel.mention}",
+                f"✅ **Payment confirmed on-chain.**\n\nAccess: **{row['plan_hours']}H**\nExpires: <t:{int(expires)}:F>\n\nYour contact access is now unlocked.",
                 ephemeral=True,
+                view=DealAccessView(row["match_id"]),
             )
-
-            # IMPORTANT: also notify the *other* party. The previous flow only
-            # confirmed the second payer, so the first payer could see the room
-            # appear without receiving an explicit completion message.
-            completion_message = (
-                "🎉 **BOTH ACCESS PAYMENTS CONFIRMED.**\n\n"
-                "The buyer and seller have both activated their QuickSell access.\n"
-                f"🤝 **Private deal room created automatically:** {channel.mention}\n\n"
-                "Open the private room to negotiate the final price and terms. "
-                "Both parties must confirm the final deal there."
-            )
-            if other:
-                try:
-                    await other.send(completion_message)
-                except discord.HTTPException:
-                    # DM may be disabled. The room itself remains accessible to
-                    # the user, and the payer still receives the ephemeral notice.
-                    pass
-        else:
-            await interaction.followup.send(
-                "✅ **Payment confirmed on-chain.** Both parties have paid, but the private room could not be created automatically. "
-                "Check the bot's Manage Channels/Manage Permissions permissions.",
-                ephemeral=True,
-            )
+        except discord.HTTPException:
+            pass
         return "CONFIRMED"
     if state == "INVALID":
         con.execute("UPDATE access_passes SET status='FAILED' WHERE id=?", (pass_id,))
         con.commit()
     con.close()
     return state
+
+
+class DealAccessView(discord.ui.View):
+    def __init__(self, match_id: int):
+        super().__init__(timeout=24 * 60 * 60)
+        self.match_id = match_id
+
+    @discord.ui.button(label="📩 Open Private Deal Room", style=discord.ButtonStyle.success)
+    async def open_room(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await unlock_contact(interaction, self.match_id)
 
 
 async def unlock_contact(interaction: discord.Interaction, match_id: int):
@@ -713,11 +626,47 @@ def match_users(match: sqlite3.Row) -> tuple[int, int]:
     return int(match["buyer_id"]), int(match["seller_id"])
 
 
+FINAL_CONFIRMATION_PROMPTS = {}
+
+
+async def disable_confirmation_prompt(bot: commands.Bot, match_id: int):
+    message_id = FINAL_CONFIRMATION_PROMPTS.pop(match_id, None)
+    if not message_id:
+        return
+    match = get_match_for_user(0, match_id) if False else None
+    # The prompt is only an in-memory UX helper; DB state remains authoritative.
+    for guild in bot.guilds:
+        channel = None
+        con = db()
+        row = con.execute("SELECT channel_id FROM matches WHERE id=?", (match_id,)).fetchone()
+        con.close()
+        if row and row["channel_id"]:
+            channel = guild.get_channel(row["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            message = await channel.fetch_message(message_id)
+            view = message.components
+            # Replace the old interactive view with disabled buttons.
+            disabled = DealConfirmView(match_id, disabled=True)
+            await message.edit(view=disabled)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+        break
+
+
+async def close_deal_channel(channel: Optional[discord.TextChannel], delay: int = 10):
+    if channel is None:
+        return
+    await asyncio.sleep(delay)
+    try:
+        await channel.delete(reason="QuickSell deal closed")
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+        print(f"[QuickSell] deal channel deletion failed: {exc}")
+
+
 async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
-    if guild is None: return None
-    con=db(); fresh=con.execute("""SELECT m.*, b.user_id buyer_id, b.collection, b.mint, b.amount buyer_offer, b.guild_id, s.user_id seller_id, s.amount seller_asking FROM matches m JOIN requests b ON b.id=m.buy_request_id JOIN requests s ON s.id=m.sell_request_id WHERE m.id=?""",(match["id"],)).fetchone(); con.close()
-    if fresh: match=fresh
-    existing=guild.get_channel(match["channel_id"]) if match["channel_id"] else None
+    existing = guild.get_channel(match["channel_id"]) if match["channel_id"] else None
     if isinstance(existing, discord.TextChannel):
         return existing
     category = discord.utils.get(guild.categories, name=PRIVATE_MATCH_CATEGORY)
@@ -738,7 +687,7 @@ async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
         topic="QuickSell private buyer/seller negotiation room", reason="QuickSell real potential match"
     )
     con = db()
-    con.execute("UPDATE matches SET channel_id=?,channel_name=?,status=? WHERE id=?", (channel.id, channel.name, DealStatus.WAITING_CONFIRMATION.value, match["id"]))
+    con.execute("UPDATE matches SET channel_id=?,channel_name=?,status=?,buyer_confirmed=0,seller_confirmed=0 WHERE id=?", (channel.id, channel.name, DealStatus.WAITING_CONFIRMATION.value, match["id"]))
     con.commit()
     con.close()
     embed = discord.Embed(
@@ -747,70 +696,58 @@ async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
             f"NFT / Collection: **{match['collection']}**\n"
             f"Seller asking price: **{format_sol(match['seller_asking'])}**\n"
             f"Buyer offer: **{format_sol(match['buyer_offer'])}**\n\n"
-            "🗣️ **DISCUSS THE PRICE HERE**\n"
-            "Write directly in this private room and negotiate the final price between yourselves.\n\n"
-            "⚠️ **IMPORTANT: DO NOT CONFIRM THE DEAL YET.**\n"
-            "First finish your discussion and agree on the final terms.\n"
-            "When you are both finished negotiating, use **I AGREE ON THE FINAL PRICE** below to open the final confirmation.\n"
+            "💬 **DISCUSS THE PRICE HERE**\n"
+            "Continue the negotiation directly in this private room. You can discuss the final price and conditions freely.\n\n"
+            "⚠️ **DO NOT CONFIRM YET.**\n"
+            "When you are both genuinely finished negotiating, use `/confirm` to open the final confirmation step."
         ), color=discord.Color.blurple()
     )
-    await channel.send(content=f"<@{match['buyer_id']}> <@{match['seller_id']}>", embed=embed, view=DealReadyView(match["id"]))
+    await channel.send(content=f"<@{match['buyer_id']}> <@{match['seller_id']}>", embed=embed)
+    await channel.send(
+        "💬 **NEGOTIATION IN PROGRESS**\n\n"
+        "Talk to each other first. When you are finished, type `/confirm`.\n"
+        "`/confirm` does **not** accept the deal; it only opens the final confirmation buttons at the bottom."
+    )
     return channel
 
 
-class DealReadyView(discord.ui.View):
-    def __init__(self, match_id: int):
-        super().__init__(timeout=DEAL_CHANNEL_TTL_HOURS * 60 * 60)
-        self.match_id = match_id
-
-    @discord.ui.button(label="I AGREE ON THE FINAL PRICE", emoji="🤝", style=discord.ButtonStyle.primary)
-    async def ready(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = get_match_for_user(interaction.user.id, self.match_id)
-        if not match or match["status"] in {DealStatus.DECLINED.value, DealStatus.CLOSED.value, DealStatus.DEAL_CONFIRMED.value}:
-            await interaction.response.send_message("❌ This deal is no longer active.", ephemeral=True)
-            return
-        if not interaction.channel:
-            await interaction.response.send_message("❌ Deal room not found.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "🔔 **FINAL CONFIRMATION**\n\n"
-            "If you have finished discussing and agreed on the final price/terms, **BOTH sides must now choose one of the two buttons below**.\n\n"
-            "🟢 **I AGREE TO THE DEAL** = you accept the final deal.\n"
-            "🔴 **I DON'T AGREE** = you do not accept it.",
-            view=DealConfirmView(self.match_id)
-        )
-
-
 class DealConfirmView(discord.ui.View):
-    def __init__(self, match_id: int):
-        super().__init__(timeout=DEAL_CHANNEL_TTL_HOURS * 60 * 60)
+    def __init__(self, match_id: int, disabled: bool = False):
+        super().__init__(timeout=15 * 60)
         self.match_id = match_id
+        self.disabled_state = disabled
 
     @discord.ui.button(label="I AGREE TO THE DEAL", emoji="🤝", style=discord.ButtonStyle.success)
     async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.disabled_state:
+            await interaction.response.send_message("⚠️ This confirmation is no longer valid. If negotiation continues, use `/confirm` again.", ephemeral=True)
+            return
         await confirm_deal(interaction, self.match_id, True)
 
     @discord.ui.button(label="I DON'T AGREE", emoji="❌", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.disabled_state:
+            await interaction.response.send_message("⚠️ This confirmation is no longer valid. If negotiation continues, use `/confirm` again.", ephemeral=True)
+            return
         await confirm_deal(interaction, self.match_id, False)
 
 
 async def confirm_deal(interaction: discord.Interaction, match_id: int, agree: bool):
     match = get_match_for_user(interaction.user.id, match_id)
-    if not match:
-        await interaction.response.send_message("❌ This deal is not available to you.", ephemeral=True)
+    if not match or match["channel_id"] != getattr(interaction.channel, "id", None):
+        await interaction.response.send_message("❌ This deal is not available in this channel.", ephemeral=True)
+        return
+    if match["status"] in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
+        await interaction.response.send_message("❌ This deal is already closed.", ephemeral=True)
         return
     con = db()
     if not agree:
         con.execute("UPDATE matches SET status=?,closed_at=? WHERE id=?", (DealStatus.DECLINED.value, now(), match_id))
         con.commit()
         con.close()
-        await interaction.response.send_message("❌ Your side declined the deal. The deal is now closed.", ephemeral=True)
-        if interaction.channel:
-            try:
-                await interaction.channel.send(f"❌ <@{interaction.user.id}> declined the deal. The deal is closed.")
-            except discord.HTTPException:
-                pass
+        FINAL_CONFIRMATION_PROMPTS.pop(match_id, None)
+        await interaction.response.send_message("❌ **DEAL DECLINED** — your side did not agree. The deal is now closed.")
+        asyncio.create_task(close_deal_channel(interaction.channel))
         return
     if interaction.user.id == match["buyer_id"]:
         con.execute("UPDATE matches SET buyer_confirmed=1 WHERE id=?", (match_id,))
@@ -818,35 +755,69 @@ async def confirm_deal(interaction: discord.Interaction, match_id: int, agree: b
         con.execute("UPDATE matches SET seller_confirmed=1 WHERE id=?", (match_id,))
     con.commit()
     row = con.execute("SELECT buyer_confirmed,seller_confirmed FROM matches WHERE id=?", (match_id,)).fetchone()
+    con.close()
     if row["buyer_confirmed"] and row["seller_confirmed"]:
-        con.execute("UPDATE matches SET status=? WHERE id=?", (DealStatus.DEAL_CONFIRMED.value, match_id))
+        con = db()
+        con.execute("UPDATE matches SET status=?,closed_at=? WHERE id=?", (DealStatus.DEAL_CONFIRMED.value, now(), match_id))
         con.commit()
         con.close()
-        message = "🎉 **DEAL CONFIRMED** — both buyer and seller confirmed the deal."
-        await interaction.response.send_message(message)
-        other_id = match["seller_id"] if interaction.user.id == match["buyer_id"] else match["buyer_id"]
-        other = interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
-        if other:
-            try:
-                await other.send(message)
-            except discord.HTTPException:
-                pass
+        FINAL_CONFIRMATION_PROMPTS.pop(match_id, None)
+        await interaction.response.send_message(
+            "🎉 **DEAL CONFIRMED**\n\nBoth buyer and seller confirmed the final deal.\n\n🗑️ This private Deal Room will be closed and removed shortly."
+        )
+        asyncio.create_task(close_deal_channel(interaction.channel))
         return
-    con.close()
     waiting_for = "seller" if interaction.user.id == match["buyer_id"] else "buyer"
     await interaction.response.send_message(
-        f"🤝 Your confirmation has been recorded. Waiting for the **{waiting_for}** to confirm.", ephemeral=True
+        f"🤝 Your final confirmation has been recorded. Waiting for the **{waiting_for}** to confirm.", ephemeral=True
     )
-    other_id = match["seller_id"] if interaction.user.id == match["buyer_id"] else match["buyer_id"]
-    other = interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
-    if other:
+
+
+async def confirm_command(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("❌ Use `/confirm` inside your private QuickSell Deal Room.", ephemeral=True)
+        return
+    con = db()
+    match = con.execute(
+        "SELECT m.*, b.user_id buyer_id, b.collection, b.guild_id, s.user_id seller_id "
+        "FROM matches m JOIN requests b ON b.id=m.buy_request_id JOIN requests s ON s.id=m.sell_request_id "
+        "WHERE m.channel_id=?", (interaction.channel.id,)
+    ).fetchone()
+    con.close()
+    if not match or interaction.user.id not in {match["buyer_id"], match["seller_id"]}:
+        await interaction.response.send_message("❌ This is not your QuickSell Deal Room.", ephemeral=True)
+        return
+    if match["status"] in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
+        await interaction.response.send_message("❌ This deal is already closed.", ephemeral=True)
+        return
+    con = db()
+    con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match["id"]))
+    con.commit()
+    con.close()
+    old = FINAL_CONFIRMATION_PROMPTS.pop(match["id"], None)
+    if old:
         try:
-            await other.send(
-                "🔔 **The other party has confirmed the final deal.**\n\n"
-                "Please return to your private deal room and click **I AGREE TO THE DEAL** if you also accept the final terms."
-            )
-        except discord.HTTPException:
+            old_message = await interaction.channel.fetch_message(old)
+            await old_message.edit(view=DealConfirmView(match["id"], disabled=True))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+    await interaction.response.send_message(
+        "🔔 **FINAL CONFIRMATION**\n\n"
+        "The negotiation appears to be finished. Review the final price and conditions one last time.\n\n"
+        "⚠️ **Important:** Clicking **I AGREE TO THE DEAL** means you accept the final terms you discussed. "
+        "If you are not ready, do not click it.\n\n"
+        "If negotiation continues after this message, this confirmation will be cancelled and you can use `/confirm` again.",
+        view=DealConfirmView(match["id"]),
+    )
+    # The response itself is the bottom-most confirmation prompt.
+    try:
+        # Interaction response is not directly addressable, so fetch the latest bot message.
+        async for msg in interaction.channel.history(limit=5):
+            if msg.author.id == interaction.client.user.id and msg.components:
+                FINAL_CONFIRMATION_PROMPTS[match["id"]] = msg.id
+                break
+    except discord.HTTPException:
+        pass
 
 
 class MainView(discord.ui.View):
@@ -905,10 +876,10 @@ class MainView(discord.ui.View):
             "1. BUY or SELL is free.\n"
             "2. QuickSell checks real active requests continuously.\n"
             "3. Matching uses collection/mint compatibility; price does not block the match.\n"
-            "4. After a real potential match, both parties decide whether to proceed.\n"
-            "5. Only after both agree, each party chooses and pays for their own 24H or 48H access.\n"
-            "6. The private deal room is created automatically after both payments are verified on-chain.\n"
-            "7. Buyer and seller negotiate privately and both confirm the final deal.\n\n"
+            "4. After a real potential match, contact is locked.\n"
+            "5. A 24H or 48H pass is verified on-chain before contact is unlocked.\n"
+            "6. Buyer and seller negotiate privately.\n"
+            "7. Both must confirm the final deal for DEAL_CONFIRMED.\n\n"
             "QuickSell connects the parties; it does not guarantee the NFT transfer or payment between them.",
             ephemeral=True,
         )
@@ -939,7 +910,6 @@ class MyMatchesView(discord.ui.View):
 class QuickSellBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.match_task: Optional[asyncio.Task] = None
 
@@ -955,114 +925,17 @@ class QuickSellBot(commands.Bot):
     async def ensure_public_quicksell(self, guild: discord.Guild):
         me = guild.me
         if me is None:
-            print(f"[QuickSell] ERROR: guild.me unavailable in {guild.name}")
             return None
-
-        # Audit guild-level permissions BEFORE attempting any create/edit action.
-        # This prevents a vague Discord 50013 from hiding the real cause.
-        gp = me.guild_permissions
-        print(
-            "[QuickSell] BOT GUILD PERMISSIONS: "
-            + ", ".join(
-                f"{name}={'OK' if value else 'MISSING'}"
-                for name, value in {
-                    "View Channel": gp.view_channel,
-                    "Send Messages": gp.send_messages,
-                    "Embed Links": gp.embed_links,
-                    "Read Message History": gp.read_message_history,
-                    "Manage Channels": gp.manage_channels,
-                    "Manage Permissions": gp.manage_permissions,
-                    "Manage Messages": gp.manage_messages,
-                    "Create Invite": gp.create_instant_invite,
-                }.items()
-            )
-        )
-
         category = discord.utils.get(guild.categories, name=QUICKSELL_CATEGORY)
         if category is None:
-            if not gp.manage_channels:
-                print(
-                    f"[QuickSell] BLOCKED: category {QUICKSELL_CATEGORY!r} does not exist "
-                    "and the bot is missing Manage Channels. "
-                    "Create the category manually or grant Manage Channels."
-                )
-                return None
-            print(f"[QuickSell] STEP: creating category {QUICKSELL_CATEGORY}")
-            try:
-                category = await guild.create_category(
-                    QUICKSELL_CATEGORY,
-                    reason="QuickSell public marketplace",
-                )
-            except discord.Forbidden as exc:
-                print(
-                    "[QuickSell] 403 DURING CREATE_CATEGORY: "
-                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
-                    f"text={getattr(exc, 'text', str(exc))}"
-                )
-                return None
-            except discord.HTTPException as exc:
-                print(
-                    "[QuickSell] HTTP ERROR DURING CREATE_CATEGORY: "
-                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
-                    f"text={getattr(exc, 'text', str(exc))}"
-                )
-                return None
-
+            category = await guild.create_category(QUICKSELL_CATEGORY, reason="QuickSell public marketplace")
         channel = discord.utils.get(category.text_channels, name=QUICKSELL_CHANNEL)
         if channel is None:
-            if not gp.manage_channels:
-                print(
-                    f"[QuickSell] BLOCKED: #{QUICKSELL_CHANNEL} does not exist "
-                    "and the bot is missing Manage Channels. "
-                    "Create the channel manually or grant Manage Channels."
-                )
-                return None
-            print(f"[QuickSell] STEP: creating #{QUICKSELL_CHANNEL}")
-            try:
-                channel = await guild.create_text_channel(
-                    QUICKSELL_CHANNEL,
-                    category=category,
-                    topic="QuickSell NFT buyer/seller marketplace",
-                    reason="QuickSell dedicated channel",
-                )
-            except discord.Forbidden as exc:
-                print(
-                    "[QuickSell] 403 DURING CREATE_CHANNEL: "
-                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
-                    f"text={getattr(exc, 'text', str(exc))}"
-                )
-                return None
-            except discord.HTTPException as exc:
-                print(
-                    "[QuickSell] HTTP ERROR DURING CREATE_CHANNEL: "
-                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
-                    f"text={getattr(exc, 'text', str(exc))}"
-                )
-                return None
-        # Do not modify @everyone permissions automatically. The public QuickSell
-        # channel may inherit permissions from its category, and changing them
-        # requires Manage Permissions/Manage Channels. More importantly, a 403 here
-        # must never prevent the bot from publishing its own menu.
-        channel_permissions = channel.permissions_for(me)
-        required = {
-            "View Channel": channel_permissions.view_channel,
-            "Send Messages": channel_permissions.send_messages,
-            "Embed Links": channel_permissions.embed_links,
-            "Read Message History": channel_permissions.read_message_history,
-        }
-        missing = [name for name, granted in required.items() if not granted]
-        print(
-            f"[QuickSell] #{channel.name} (id={channel.id}) bot permissions: "
-            + ", ".join(f"{name}={'OK' if granted else 'MISSING'}" for name, granted in required.items())
-        )
-        if missing:
-            raise RuntimeError(
-                "Missing effective permissions in #"
-                + channel.name
-                + ": "
-                + ", ".join(missing)
-            )
-
+            channel = await guild.create_text_channel(QUICKSELL_CHANNEL, category=category, topic="QuickSell NFT buyer/seller marketplace", reason="QuickSell dedicated channel")
+        try:
+            await channel.set_permissions(guild.default_role, view_channel=True, read_message_history=True, send_messages=False)
+        except discord.HTTPException:
+            pass
         await self.remove_old_launchers(guild)
         found = False
         try:
@@ -1088,119 +961,66 @@ class QuickSellBot(commands.Bot):
                 ), color=discord.Color.blurple()
             )
             try:
-                sent = await channel.send(embed=embed, view=MainView())
-                print(
-                    f"[QuickSell] full menu published DIRECTLY in #{QUICKSELL_CHANNEL} "
-                    f"(message_id={sent.id})"
-                )
-            except discord.Forbidden as exc:
-                perms = channel.permissions_for(me)
-                print(
-                    f"[QuickSell] CANNOT PUBLISH MENU IN #{QUICKSELL_CHANNEL}: "
-                    f"Discord 403/50013; View Channel={perms.view_channel}, "
-                    f"Send Messages={perms.send_messages}, Embed Links={perms.embed_links}, "
-                    f"Read Message History={perms.read_message_history}; error={exc}"
-                )
-                raise
-            except discord.HTTPException as exc:
-                print(
-                    f"[QuickSell] MENU PUBLISH HTTP ERROR IN #{QUICKSELL_CHANNEL}: "
-                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, text={getattr(exc, 'text', str(exc))}"
-                )
+                await channel.send(embed=embed, view=MainView())
+                print(f"[QuickSell] full menu published DIRECTLY in #{QUICKSELL_CHANNEL}")
+            except discord.Forbidden:
+                print(f"[QuickSell] CANNOT PUBLISH MENU IN #{QUICKSELL_CHANNEL}: check View Channel, Send Messages, Embed Links, and Read Message History permissions")
                 raise
         else:
             print(f"[QuickSell] full menu already exists in #{QUICKSELL_CHANNEL}")
         return channel
 
     async def remove_old_launchers(self, guild: discord.Guild):
-        """Remove the OLD QuickSell launcher from every channel except #🛒-quicksell.
+        """Remove legacy QuickSell launcher messages outside #🛒-quicksell.
 
-        This is intentionally stricter than checking one custom_id because older
-        builds may have used a different custom_id. We identify the legacy
-        launcher by its visible QuickSell embed/button signature. Only matching
-        legacy messages are touched; normal #rules messages remain untouched.
+        Older builds used a one-button launcher in #rules. New builds put the
+        complete QuickSell menu directly in the dedicated channel. We therefore
+        remove only bot-authored messages that are clearly QuickSell launchers;
+        ordinary user messages and unrelated bot messages are untouched.
         """
+        target_name = QUICKSELL_CHANNEL
         for channel in guild.text_channels:
-            if (channel.name == QUICKSELL_CHANNEL
-                    and channel.category
-                    and channel.category.name == QUICKSELL_CATEGORY):
+            if channel.name == target_name and channel.category and channel.category.name == QUICKSELL_CATEGORY:
                 continue
-
             try:
-                async for message in channel.history(limit=500):
-                    # Read the message's visible signature. This catches the old
-                    # launcher even when its custom_id was different in an older build.
-                    component_labels = []
-                    component_ids = []
-                    for row in message.components:
-                        for component in row.children:
-                            label = getattr(component, "label", None)
-                            custom_id = getattr(component, "custom_id", None)
-                            if label:
-                                component_labels.append(str(label).strip().casefold())
-                            if custom_id:
-                                component_ids.append(str(custom_id))
-
-                    content = (message.content or "").casefold()
-                    embed_parts = []
-                    for embed in message.embeds:
-                        embed_parts.append(embed.title or "")
-                        embed_parts.append(embed.description or "")
-                        for field in embed.fields:
-                            embed_parts.extend([field.name or "", field.value or ""])
-                    embed_text = " ".join(embed_parts).casefold()
-
-                    has_old_custom_id = "quicksell:launch" in component_ids
-                    has_old_button = "quicksell" in component_labels
-                    has_quicksell_identity = (
-                        "quicksell" in content
-                        or "quicksell" in embed_text
-                    )
-                    has_marketplace_text = (
-                        "nft buyer/seller matching marketplace" in embed_text
-                        or "click the button below to open quicksell" in embed_text
-                    )
-
-                    is_legacy_launcher = (
-                        has_old_custom_id
-                        or (has_old_button and has_quicksell_identity)
-                        or (has_marketplace_text and has_old_button)
-                    )
-
-                    if not is_legacy_launcher:
+                async for message in channel.history(limit=200):
+                    if self.user is None or message.author.id != self.user.id:
                         continue
 
-                    # Prefer deleting our own old message. If an older build used
-                    # another bot identity, Manage Messages allows the current bot
-                    # to remove this exact legacy launcher safely.
-                    if message.author.id != self.user.id and not channel.permissions_for(guild.me).manage_messages:
-                        print(
-                            f"[QuickSell] found legacy launcher in #{channel.name}, "
-                            "but cannot remove it: current bot lacks Manage Messages"
-                        )
+                    component_ids = [
+                        getattr(c, "custom_id", "")
+                        for r in message.components
+                        for c in r.children
+                    ]
+                    content = (message.content or "").casefold()
+                    embed_text = " ".join(
+                        [
+                            (e.title or ""),
+                            (e.description or ""),
+                        ]
+                        + [f.field.name + " " + f.field.value for e in message.embeds for f in e.fields]
+                    ).casefold()
+
+                    has_legacy_button = "quicksell:launch" in component_ids
+                    looks_like_quicksell_launcher = (
+                        "quicksell" in content or "quicksell" in embed_text
+                    ) and any(
+                        x in component_ids
+                        for x in {"quicksell:launch", "quicksell:buy", "quicksell:sell"}
+                    )
+
+                    if not (has_legacy_button or looks_like_quicksell_launcher):
                         continue
 
                     try:
-                        await message.delete(
-                            reason="Remove obsolete QuickSell launcher outside dedicated #🛒-quicksell"
-                        )
-                        print(
-                            f"[QuickSell] REMOVED old QuickSell launcher from #{channel.name} "
-                            f"(message={message.id})"
-                        )
+                        await message.delete(reason="Remove obsolete QuickSell launcher outside dedicated channel")
+                        print(f"[QuickSell] removed legacy QuickSell message from #{channel.name}")
                     except discord.Forbidden:
-                        print(
-                            f"[QuickSell] CANNOT REMOVE old QuickSell launcher from #{channel.name}: "
-                            "check Manage Messages permission"
-                        )
+                        print(f"[QuickSell] CANNOT REMOVE legacy QuickSell message from #{channel.name}: missing Manage Messages")
                     except discord.HTTPException as exc:
-                        print(
-                            f"[QuickSell] deletion failed in #{channel.name}: {exc}"
-                        )
+                        print(f"[QuickSell] legacy QuickSell deletion failed in #{channel.name}: {exc}")
             except discord.Forbidden:
-                print(
-                    f"[QuickSell] cannot inspect #{channel.name}: missing Read Message History"
-                )
+                print(f"[QuickSell] cannot inspect #{channel.name}: missing Read Message History")
             except discord.HTTPException as exc:
                 print(f"[QuickSell] cannot inspect #{channel.name}: {exc}")
 
@@ -1218,52 +1038,51 @@ class QuickSellBot(commands.Bot):
             print(f"[QuickSell] invite creation failed: {exc}")
             return None
 
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not isinstance(message.channel, discord.TextChannel):
+            return
+        con = db()
+        match = con.execute(
+            "SELECT id,buyer_confirmed,seller_confirmed,status FROM matches WHERE channel_id=?",
+            (message.channel.id,),
+        ).fetchone()
+        if match and match["status"] not in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
+            if match["buyer_confirmed"] or match["seller_confirmed"]:
+                con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match["id"]))
+                con.commit()
+                prompt_id = FINAL_CONFIRMATION_PROMPTS.pop(match["id"], None)
+                con.close()
+                if prompt_id:
+                    try:
+                        prompt = await message.channel.fetch_message(prompt_id)
+                        await prompt.edit(view=DealConfirmView(match["id"], disabled=True))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+                await message.channel.send(
+                    "💬 **NEGOTIATION RESUMED** — the final confirmation was cancelled because a new message was sent.\n"
+                    "When you are finished again, use `/confirm`."
+                )
+            else:
+                con.close()
+        else:
+            con.close()
+
     async def on_ready(self):
         print(f"[QuickSell] connected as {self.user} (id={self.user.id})")
         print("[QuickSell] matching engine running every 1 second")
-        print(f"[QuickSell] payment network={QUICKSELL_NETWORK.upper()}")
-        print(f"[QuickSell] payment RPC={QUICKSELL_RPC_URL}")
-        print(f"[QuickSell] payment wallet={QUICKSELL_PAYMENT_WALLET}")
-        print(f"[QuickSell] test prices: 24H={PASS_24H_SOL} SOL, 48H={PASS_48H_SOL} SOL")
         for guild in self.guilds:
-            print(f"[QuickSell] configuring guild: {guild.name} (id={guild.id})")
-            me = guild.me
-            if me is None:
-                print("[QuickSell] ERROR: bot member is unavailable in this guild")
-                continue
-            gp = me.guild_permissions
-            print(
-                "[QuickSell] guild permissions: "
-                + ", ".join(
-                    f"{name}={'OK' if value else 'MISSING'}"
-                    for name, value in {
-                        "Manage Channels": gp.manage_channels,
-                        "Manage Permissions": gp.manage_permissions,
-                        "Manage Messages": gp.manage_messages,
-                        "Create Invite": gp.create_instant_invite,
-                    }.items()
-                )
-            )
             try:
                 channel = await self.ensure_public_quicksell(guild)
                 if channel:
                     await self.ensure_quicksell_invite(channel)
-                    print(f"[QuickSell] PUBLIC SETUP COMPLETE: #{channel.name} (id={channel.id})")
-            except discord.Forbidden as exc:
-                print(
-                    f"[QuickSell] SETUP FORBIDDEN in {guild.name}: "
-                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, text={getattr(exc, 'text', str(exc))}"
-                )
-            except discord.HTTPException as exc:
-                print(
-                    f"[QuickSell] SETUP HTTP ERROR in {guild.name}: "
-                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, text={getattr(exc, 'text', str(exc))}"
-                )
-            except Exception as exc:
-                print(f"[QuickSell] SETUP UNEXPECTED ERROR in {guild.name}: {type(exc).__name__}: {exc}")
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                print(f"[QuickSell] setup failed in {guild.name}: {exc}")
 
 
 bot = QuickSellBot()
+
+# /confirm is registered after the bot instance exists.
+bot.tree.command(name="confirm", description="Finish negotiation and open the final deal confirmation")(confirm_command)
 
 
 @bot.tree.command(name="quicksell", description="Open the QuickSell marketplace")
