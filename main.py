@@ -579,12 +579,32 @@ async def verify_and_apply_payment(interaction: discord.Interaction, pass_id: in
         )
         con.commit()
         con.close()
+        # Automatically create the private deal room as soon as payment is confirmed.
+        # The user must NOT have to search My Matches or click another button to find it.
         try:
-            await interaction.followup.send(
-                f"✅ **Payment confirmed on-chain.**\n\nAccess: **{row['plan_hours']}H**\nExpires: <t:{int(expires)}:F>\n\nYour contact access is now unlocked.",
-                ephemeral=True,
-                view=DealAccessView(row["match_id"]),
-            )
+            match = get_match_for_user(interaction.user.id, row["match_id"])
+            channel = None
+            if match and interaction.guild and interaction.guild.id == match["guild_id"]:
+                channel = await ensure_deal_channel(interaction.guild, match)
+
+            if channel is not None:
+                await interaction.followup.send(
+                    f"✅ **Payment confirmed on-chain.**\n\n"
+                    f"Access: **{row['plan_hours']}H**\n"
+                    f"Expires: <t:{int(expires)}:F>\n\n"
+                    f"🤝 **Your private deal room is ready.**\n"
+                    f"Go directly here: {channel.mention}\n\n"
+                    "The buyer and seller can now negotiate. Both sides must confirm the final deal.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"✅ **Payment confirmed on-chain.**\n\n"
+                    f"Access: **{row['plan_hours']}H**\n"
+                    f"Expires: <t:{int(expires)}:F>\n\n"
+                    "⚠️ The private deal room could not be created automatically. Please stay in the QuickSell server and retry from your match.",
+                    ephemeral=True,
+                )
         except discord.HTTPException:
             pass
         return "CONFIRMED"
