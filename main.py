@@ -645,9 +645,38 @@ async def verify_and_apply_payment(interaction: discord.Interaction, pass_id: in
             except discord.HTTPException: guild=None
         channel=await ensure_deal_channel(guild,match) if guild else None
         if channel:
-            await interaction.followup.send(f"🎉 **BOTH ACCESS PAYMENTS CONFIRMED.**\n\nYour access: **{row['plan_hours']}H**\nExpires: <t:{int(expires)}:F>\n\n🤝 **Private deal room created automatically:** {channel.mention}",ephemeral=True)
+            # Notify the payer immediately (ephemeral confirmation).
+            await interaction.followup.send(
+                f"🎉 **BOTH ACCESS PAYMENTS CONFIRMED.**\n\n"
+                f"Your access: **{row['plan_hours']}H**\n"
+                f"Expires: <t:{int(expires)}:F>\n\n"
+                f"🤝 **Private deal room created automatically:** {channel.mention}",
+                ephemeral=True,
+            )
+
+            # IMPORTANT: also notify the *other* party. The previous flow only
+            # confirmed the second payer, so the first payer could see the room
+            # appear without receiving an explicit completion message.
+            completion_message = (
+                "🎉 **BOTH ACCESS PAYMENTS CONFIRMED.**\n\n"
+                "The buyer and seller have both activated their QuickSell access.\n"
+                f"🤝 **Private deal room created automatically:** {channel.mention}\n\n"
+                "Open the private room to negotiate the final price and terms. "
+                "Both parties must confirm the final deal there."
+            )
+            if other:
+                try:
+                    await other.send(completion_message)
+                except discord.HTTPException:
+                    # DM may be disabled. The room itself remains accessible to
+                    # the user, and the payer still receives the ephemeral notice.
+                    pass
         else:
-            await interaction.followup.send("✅ **Payment confirmed on-chain.** Both parties have paid, but the private room could not be created automatically. Check the bot's Manage Channels/Manage Permissions permissions.",ephemeral=True)
+            await interaction.followup.send(
+                "✅ **Payment confirmed on-chain.** Both parties have paid, but the private room could not be created automatically. "
+                "Check the bot's Manage Channels/Manage Permissions permissions.",
+                ephemeral=True,
+            )
         return "CONFIRMED"
     if state == "INVALID":
         con.execute("UPDATE access_passes SET status='FAILED' WHERE id=?", (pass_id,))
@@ -718,12 +747,38 @@ async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
             f"NFT / Collection: **{match['collection']}**\n"
             f"Seller asking price: **{format_sol(match['seller_asking'])}**\n"
             f"Buyer offer: **{format_sol(match['buyer_offer'])}**\n\n"
-            "💬 Discuss the price directly. The price gap does not prevent the deal.\n\n"
-            "When you have agreed on the final terms, BOTH sides must click **I AGREE TO THE DEAL**."
+            "🗣️ **DISCUSS THE PRICE HERE**\n"
+            "Write directly in this private room and negotiate the final price between yourselves.\n\n"
+            "⚠️ **IMPORTANT: DO NOT CONFIRM THE DEAL YET.**\n"
+            "First finish your discussion and agree on the final terms.\n"
+            "When you are both finished negotiating, use **I AGREE ON THE FINAL PRICE** below to open the final confirmation.\n"
         ), color=discord.Color.blurple()
     )
-    await channel.send(content=f"<@{match['buyer_id']}> <@{match['seller_id']}>", embed=embed, view=DealConfirmView(match["id"]))
+    await channel.send(content=f"<@{match['buyer_id']}> <@{match['seller_id']}>", embed=embed, view=DealReadyView(match["id"]))
     return channel
+
+
+class DealReadyView(discord.ui.View):
+    def __init__(self, match_id: int):
+        super().__init__(timeout=DEAL_CHANNEL_TTL_HOURS * 60 * 60)
+        self.match_id = match_id
+
+    @discord.ui.button(label="I AGREE ON THE FINAL PRICE", emoji="🤝", style=discord.ButtonStyle.primary)
+    async def ready(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = get_match_for_user(interaction.user.id, self.match_id)
+        if not match or match["status"] in {DealStatus.DECLINED.value, DealStatus.CLOSED.value, DealStatus.DEAL_CONFIRMED.value}:
+            await interaction.response.send_message("❌ This deal is no longer active.", ephemeral=True)
+            return
+        if not interaction.channel:
+            await interaction.response.send_message("❌ Deal room not found.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "🔔 **FINAL CONFIRMATION**\n\n"
+            "If you have finished discussing and agreed on the final price/terms, **BOTH sides must now choose one of the two buttons below**.\n\n"
+            "🟢 **I AGREE TO THE DEAL** = you accept the final deal.\n"
+            "🔴 **I DON'T AGREE** = you do not accept it.",
+            view=DealConfirmView(self.match_id)
+        )
 
 
 class DealConfirmView(discord.ui.View):
@@ -767,13 +822,31 @@ async def confirm_deal(interaction: discord.Interaction, match_id: int, agree: b
         con.execute("UPDATE matches SET status=? WHERE id=?", (DealStatus.DEAL_CONFIRMED.value, match_id))
         con.commit()
         con.close()
-        await interaction.response.send_message("✅ **DEAL CONFIRMED** — both buyer and seller confirmed the deal.")
+        message = "🎉 **DEAL CONFIRMED** — both buyer and seller confirmed the deal."
+        await interaction.response.send_message(message)
+        other_id = match["seller_id"] if interaction.user.id == match["buyer_id"] else match["buyer_id"]
+        other = interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
+        if other:
+            try:
+                await other.send(message)
+            except discord.HTTPException:
+                pass
         return
     con.close()
     waiting_for = "seller" if interaction.user.id == match["buyer_id"] else "buyer"
     await interaction.response.send_message(
         f"🤝 Your confirmation has been recorded. Waiting for the **{waiting_for}** to confirm.", ephemeral=True
     )
+    other_id = match["seller_id"] if interaction.user.id == match["buyer_id"] else match["buyer_id"]
+    other = interaction.client.get_user(other_id) or await safe_fetch_user(interaction.client, other_id)
+    if other:
+        try:
+            await other.send(
+                "🔔 **The other party has confirmed the final deal.**\n\n"
+                "Please return to your private deal room and click **I AGREE TO THE DEAL** if you also accept the final terms."
+            )
+        except discord.HTTPException:
+            pass
 
 
 class MainView(discord.ui.View):
