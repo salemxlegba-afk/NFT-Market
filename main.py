@@ -995,10 +995,14 @@ class QuickSellBot(commands.Bot):
                     content = (message.content or "").casefold()
                     embed_text = " ".join(
                         [
-                            (e.title or ""),
-                            (e.description or ""),
+                            (embed.title or ""),
+                            (embed.description or ""),
                         ]
-                        + [f.field.name + " " + f.field.value for e in message.embeds for f in e.fields]
+                        + [
+                            f.field.name + " " + f.field.value
+                            for embed in message.embeds
+                            for f in embed.fields
+                        ]
                     ).casefold()
 
                     has_legacy_button = "quicksell:launch" in component_ids
