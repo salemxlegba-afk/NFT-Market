@@ -34,11 +34,9 @@ MATCH_INTERVAL = 1.0
 QUICKSELL_CATEGORY = "🛒 QUICKSELL"
 QUICKSELL_CHANNEL = "🛒-quicksell"
 PRIVATE_MATCH_CATEGORY = "🔐 PRIVATE MATCHES"
-QUICKSELL_NETWORK = os.getenv("QUICKSELL_NETWORK", "mainnet").strip().lower()
-
+QUICKSELL_NETWORK = os.getenv("QUICKSELL_NETWORK", "devnet").strip().lower()
 DEVNET_PAYMENT_WALLET = "GuMirVy1WXGL8R1s15N1T7Dj5kANnyNHWGMbsMXHutde"
 MAINNET_PAYMENT_WALLET = "Hj142M1XAPZb8T3SiawuDyxuCt2Z8SXmKSR1CdQKLZWx"
-
 if QUICKSELL_NETWORK == "devnet":
     QUICKSELL_RPC_URL = os.getenv("QUICKSELL_RPC_URL", "https://api.devnet.solana.com")
     QUICKSELL_PAYMENT_WALLET = os.getenv("QUICKSELL_PAYMENT_WALLET", DEVNET_PAYMENT_WALLET)
@@ -203,69 +201,48 @@ async def solana_rpc(method: str, params: list) -> Optional[dict]:
 
 
 async def verify_solana_payment(signature: str, expected_sol: float) -> tuple[str, Optional[float]]:
-    """Verify a real native SOL transfer to the exact QuickSell wallet."""
+    """Return (state, observed_amount). State is CONFIRMED, PENDING or INVALID."""
     status_response = await solana_rpc(
         "getSignatureStatuses",
         [[signature], {"searchTransactionHistory": True}],
     )
     if status_response is None:
         return "PENDING", None
-
     statuses = (status_response.get("result") or {}).get("value") or []
     status = statuses[0] if statuses else None
     if status is None:
-        return "INVALID", None
+        return "PENDING", None
     if status.get("err") is not None:
         return "INVALID", None
-
     confirmation = status.get("confirmationStatus")
     if confirmation not in {"confirmed", "finalized"}:
         return "PENDING", None
 
     tx_response = await solana_rpc(
         "getTransaction",
-        [signature, {
-            "encoding": "jsonParsed",
-            "commitment": "confirmed",
-            "maxSupportedTransactionVersion": 0,
-        }],
+        [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
     )
     if tx_response is None:
         return "PENDING", None
-
-    tx = tx_response.get("result")
+    tx = (tx_response.get("result") or None)
     if tx is None:
         return "PENDING", None
-
     meta = tx.get("meta") or {}
     if meta.get("err") is not None:
         return "INVALID", None
 
-    message = ((tx.get("transaction") or {}).get("message")) or {}
-    instructions = message.get("instructions") or []
-
+    message = (((tx.get("transaction") or {}).get("message")) or {})
+    account_keys = message.get("accountKeys") or []
+    keys = [k.get("pubkey") if isinstance(k, dict) else k for k in account_keys]
+    pre = meta.get("preBalances") or []
+    post = meta.get("postBalances") or []
     observed_lamports = 0
-    for instruction in instructions:
-        if instruction.get("program") != "system":
-            continue
-        parsed = instruction.get("parsed") or {}
-        if parsed.get("type") != "transfer":
-            continue
-        info = parsed.get("info") or {}
-        if info.get("destination") != QUICKSELL_PAYMENT_WALLET:
-            continue
-        try:
-            observed_lamports += int(info.get("lamports"))
-        except (TypeError, ValueError):
-            continue
-
-    if observed_lamports <= 0:
-        return "INVALID", 0.0
-
+    for idx, key in enumerate(keys):
+        if key == QUICKSELL_PAYMENT_WALLET and idx < len(pre) and idx < len(post):
+            observed_lamports += post[idx] - pre[idx]
     observed_sol = observed_lamports / 1_000_000_000
     if observed_sol + 1e-9 < expected_sol:
         return "INVALID", observed_sol
-
     return "CONFIRMED", observed_sol
 
 
@@ -835,6 +812,7 @@ class MyMatchesView(discord.ui.View):
 class QuickSellBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.match_task: Optional[asyncio.Task] = None
 
@@ -850,17 +828,114 @@ class QuickSellBot(commands.Bot):
     async def ensure_public_quicksell(self, guild: discord.Guild):
         me = guild.me
         if me is None:
+            print(f"[QuickSell] ERROR: guild.me unavailable in {guild.name}")
             return None
+
+        # Audit guild-level permissions BEFORE attempting any create/edit action.
+        # This prevents a vague Discord 50013 from hiding the real cause.
+        gp = me.guild_permissions
+        print(
+            "[QuickSell] BOT GUILD PERMISSIONS: "
+            + ", ".join(
+                f"{name}={'OK' if value else 'MISSING'}"
+                for name, value in {
+                    "View Channel": gp.view_channel,
+                    "Send Messages": gp.send_messages,
+                    "Embed Links": gp.embed_links,
+                    "Read Message History": gp.read_message_history,
+                    "Manage Channels": gp.manage_channels,
+                    "Manage Permissions": gp.manage_permissions,
+                    "Manage Messages": gp.manage_messages,
+                    "Create Invite": gp.create_instant_invite,
+                }.items()
+            )
+        )
+
         category = discord.utils.get(guild.categories, name=QUICKSELL_CATEGORY)
         if category is None:
-            category = await guild.create_category(QUICKSELL_CATEGORY, reason="QuickSell public marketplace")
+            if not gp.manage_channels:
+                print(
+                    f"[QuickSell] BLOCKED: category {QUICKSELL_CATEGORY!r} does not exist "
+                    "and the bot is missing Manage Channels. "
+                    "Create the category manually or grant Manage Channels."
+                )
+                return None
+            print(f"[QuickSell] STEP: creating category {QUICKSELL_CATEGORY}")
+            try:
+                category = await guild.create_category(
+                    QUICKSELL_CATEGORY,
+                    reason="QuickSell public marketplace",
+                )
+            except discord.Forbidden as exc:
+                print(
+                    "[QuickSell] 403 DURING CREATE_CATEGORY: "
+                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
+                    f"text={getattr(exc, 'text', str(exc))}"
+                )
+                return None
+            except discord.HTTPException as exc:
+                print(
+                    "[QuickSell] HTTP ERROR DURING CREATE_CATEGORY: "
+                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
+                    f"text={getattr(exc, 'text', str(exc))}"
+                )
+                return None
+
         channel = discord.utils.get(category.text_channels, name=QUICKSELL_CHANNEL)
         if channel is None:
-            channel = await guild.create_text_channel(QUICKSELL_CHANNEL, category=category, topic="QuickSell NFT buyer/seller marketplace", reason="QuickSell dedicated channel")
-        try:
-            await channel.set_permissions(guild.default_role, view_channel=True, read_message_history=True, send_messages=False)
-        except discord.HTTPException:
-            pass
+            if not gp.manage_channels:
+                print(
+                    f"[QuickSell] BLOCKED: #{QUICKSELL_CHANNEL} does not exist "
+                    "and the bot is missing Manage Channels. "
+                    "Create the channel manually or grant Manage Channels."
+                )
+                return None
+            print(f"[QuickSell] STEP: creating #{QUICKSELL_CHANNEL}")
+            try:
+                channel = await guild.create_text_channel(
+                    QUICKSELL_CHANNEL,
+                    category=category,
+                    topic="QuickSell NFT buyer/seller marketplace",
+                    reason="QuickSell dedicated channel",
+                )
+            except discord.Forbidden as exc:
+                print(
+                    "[QuickSell] 403 DURING CREATE_CHANNEL: "
+                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
+                    f"text={getattr(exc, 'text', str(exc))}"
+                )
+                return None
+            except discord.HTTPException as exc:
+                print(
+                    "[QuickSell] HTTP ERROR DURING CREATE_CHANNEL: "
+                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, "
+                    f"text={getattr(exc, 'text', str(exc))}"
+                )
+                return None
+        # Do not modify @everyone permissions automatically. The public QuickSell
+        # channel may inherit permissions from its category, and changing them
+        # requires Manage Permissions/Manage Channels. More importantly, a 403 here
+        # must never prevent the bot from publishing its own menu.
+        channel_permissions = channel.permissions_for(me)
+        required = {
+            "View Channel": channel_permissions.view_channel,
+            "Send Messages": channel_permissions.send_messages,
+            "Embed Links": channel_permissions.embed_links,
+            "Read Message History": channel_permissions.read_message_history,
+        }
+        missing = [name for name, granted in required.items() if not granted]
+        print(
+            f"[QuickSell] #{channel.name} (id={channel.id}) bot permissions: "
+            + ", ".join(f"{name}={'OK' if granted else 'MISSING'}" for name, granted in required.items())
+        )
+        if missing:
+            raise RuntimeError(
+                "Missing effective permissions in #"
+                + channel.name
+                + ": "
+                + ", ".join(missing)
+            )
+
         await self.remove_old_launchers(guild)
         found = False
         try:
@@ -886,66 +961,119 @@ class QuickSellBot(commands.Bot):
                 ), color=discord.Color.blurple()
             )
             try:
-                await channel.send(embed=embed, view=MainView())
-                print(f"[QuickSell] full menu published DIRECTLY in #{QUICKSELL_CHANNEL}")
-            except discord.Forbidden:
-                print(f"[QuickSell] CANNOT PUBLISH MENU IN #{QUICKSELL_CHANNEL}: check View Channel, Send Messages, Embed Links, and Read Message History permissions")
+                sent = await channel.send(embed=embed, view=MainView())
+                print(
+                    f"[QuickSell] full menu published DIRECTLY in #{QUICKSELL_CHANNEL} "
+                    f"(message_id={sent.id})"
+                )
+            except discord.Forbidden as exc:
+                perms = channel.permissions_for(me)
+                print(
+                    f"[QuickSell] CANNOT PUBLISH MENU IN #{QUICKSELL_CHANNEL}: "
+                    f"Discord 403/50013; View Channel={perms.view_channel}, "
+                    f"Send Messages={perms.send_messages}, Embed Links={perms.embed_links}, "
+                    f"Read Message History={perms.read_message_history}; error={exc}"
+                )
+                raise
+            except discord.HTTPException as exc:
+                print(
+                    f"[QuickSell] MENU PUBLISH HTTP ERROR IN #{QUICKSELL_CHANNEL}: "
+                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, text={getattr(exc, 'text', str(exc))}"
+                )
                 raise
         else:
             print(f"[QuickSell] full menu already exists in #{QUICKSELL_CHANNEL}")
         return channel
 
     async def remove_old_launchers(self, guild: discord.Guild):
-        """Remove legacy QuickSell launcher messages outside #🛒-quicksell.
+        """Remove the OLD QuickSell launcher from every channel except #🛒-quicksell.
 
-        Older builds used a one-button launcher in #rules. New builds put the
-        complete QuickSell menu directly in the dedicated channel. We therefore
-        remove only bot-authored messages that are clearly QuickSell launchers;
-        ordinary user messages and unrelated bot messages are untouched.
+        This is intentionally stricter than checking one custom_id because older
+        builds may have used a different custom_id. We identify the legacy
+        launcher by its visible QuickSell embed/button signature. Only matching
+        legacy messages are touched; normal #rules messages remain untouched.
         """
-        target_name = QUICKSELL_CHANNEL
         for channel in guild.text_channels:
-            if channel.name == target_name and channel.category and channel.category.name == QUICKSELL_CATEGORY:
+            if (channel.name == QUICKSELL_CHANNEL
+                    and channel.category
+                    and channel.category.name == QUICKSELL_CATEGORY):
                 continue
+
             try:
-                async for message in channel.history(limit=200):
-                    if self.user is None or message.author.id != self.user.id:
-                        continue
+                async for message in channel.history(limit=500):
+                    # Read the message's visible signature. This catches the old
+                    # launcher even when its custom_id was different in an older build.
+                    component_labels = []
+                    component_ids = []
+                    for row in message.components:
+                        for component in row.children:
+                            label = getattr(component, "label", None)
+                            custom_id = getattr(component, "custom_id", None)
+                            if label:
+                                component_labels.append(str(label).strip().casefold())
+                            if custom_id:
+                                component_ids.append(str(custom_id))
 
-                    component_ids = [
-                        getattr(c, "custom_id", "")
-                        for r in message.components
-                        for c in r.children
-                    ]
                     content = (message.content or "").casefold()
-                    embed_text = " ".join(
-                        [
-                            (e.title or ""),
-                            (e.description or ""),
-                        ]
-                        + [f.field.name + " " + f.field.value for e in message.embeds for f in e.fields]
-                    ).casefold()
+                    embed_parts = []
+                    for embed in message.embeds:
+                        embed_parts.append(embed.title or "")
+                        embed_parts.append(embed.description or "")
+                        for field in embed.fields:
+                            embed_parts.extend([field.name or "", field.value or ""])
+                    embed_text = " ".join(embed_parts).casefold()
 
-                    has_legacy_button = "quicksell:launch" in component_ids
-                    looks_like_quicksell_launcher = (
-                        "quicksell" in content or "quicksell" in embed_text
-                    ) and any(
-                        x in component_ids
-                        for x in {"quicksell:launch", "quicksell:buy", "quicksell:sell"}
+                    has_old_custom_id = "quicksell:launch" in component_ids
+                    has_old_button = "quicksell" in component_labels
+                    has_quicksell_identity = (
+                        "quicksell" in content
+                        or "quicksell" in embed_text
+                    )
+                    has_marketplace_text = (
+                        "nft buyer/seller matching marketplace" in embed_text
+                        or "click the button below to open quicksell" in embed_text
                     )
 
-                    if not (has_legacy_button or looks_like_quicksell_launcher):
+                    is_legacy_launcher = (
+                        has_old_custom_id
+                        or (has_old_button and has_quicksell_identity)
+                        or (has_marketplace_text and has_old_button)
+                    )
+
+                    if not is_legacy_launcher:
+                        continue
+
+                    # Prefer deleting our own old message. If an older build used
+                    # another bot identity, Manage Messages allows the current bot
+                    # to remove this exact legacy launcher safely.
+                    if message.author.id != self.user.id and not channel.permissions_for(guild.me).manage_messages:
+                        print(
+                            f"[QuickSell] found legacy launcher in #{channel.name}, "
+                            "but cannot remove it: current bot lacks Manage Messages"
+                        )
                         continue
 
                     try:
-                        await message.delete(reason="Remove obsolete QuickSell launcher outside dedicated channel")
-                        print(f"[QuickSell] removed legacy QuickSell message from #{channel.name}")
+                        await message.delete(
+                            reason="Remove obsolete QuickSell launcher outside dedicated #🛒-quicksell"
+                        )
+                        print(
+                            f"[QuickSell] REMOVED old QuickSell launcher from #{channel.name} "
+                            f"(message={message.id})"
+                        )
                     except discord.Forbidden:
-                        print(f"[QuickSell] CANNOT REMOVE legacy QuickSell message from #{channel.name}: missing Manage Messages")
+                        print(
+                            f"[QuickSell] CANNOT REMOVE old QuickSell launcher from #{channel.name}: "
+                            "check Manage Messages permission"
+                        )
                     except discord.HTTPException as exc:
-                        print(f"[QuickSell] legacy QuickSell deletion failed in #{channel.name}: {exc}")
+                        print(
+                            f"[QuickSell] deletion failed in #{channel.name}: {exc}"
+                        )
             except discord.Forbidden:
-                print(f"[QuickSell] cannot inspect #{channel.name}: missing Read Message History")
+                print(
+                    f"[QuickSell] cannot inspect #{channel.name}: missing Read Message History"
+                )
             except discord.HTTPException as exc:
                 print(f"[QuickSell] cannot inspect #{channel.name}: {exc}")
 
@@ -966,16 +1094,46 @@ class QuickSellBot(commands.Bot):
     async def on_ready(self):
         print(f"[QuickSell] connected as {self.user} (id={self.user.id})")
         print("[QuickSell] matching engine running every 1 second")
-        print(f"[QuickSell] payment network={QUICKSELL_NETWORK.upper()} rpc={QUICKSELL_RPC_URL}")
+        print(f"[QuickSell] payment network={QUICKSELL_NETWORK.upper()}")
+        print(f"[QuickSell] payment RPC={QUICKSELL_RPC_URL}")
         print(f"[QuickSell] payment wallet={QUICKSELL_PAYMENT_WALLET}")
         print(f"[QuickSell] test prices: 24H={PASS_24H_SOL} SOL, 48H={PASS_48H_SOL} SOL")
         for guild in self.guilds:
+            print(f"[QuickSell] configuring guild: {guild.name} (id={guild.id})")
+            me = guild.me
+            if me is None:
+                print("[QuickSell] ERROR: bot member is unavailable in this guild")
+                continue
+            gp = me.guild_permissions
+            print(
+                "[QuickSell] guild permissions: "
+                + ", ".join(
+                    f"{name}={'OK' if value else 'MISSING'}"
+                    for name, value in {
+                        "Manage Channels": gp.manage_channels,
+                        "Manage Permissions": gp.manage_permissions,
+                        "Manage Messages": gp.manage_messages,
+                        "Create Invite": gp.create_instant_invite,
+                    }.items()
+                )
+            )
             try:
                 channel = await self.ensure_public_quicksell(guild)
                 if channel:
                     await self.ensure_quicksell_invite(channel)
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                print(f"[QuickSell] setup failed in {guild.name}: {exc}")
+                    print(f"[QuickSell] PUBLIC SETUP COMPLETE: #{channel.name} (id={channel.id})")
+            except discord.Forbidden as exc:
+                print(
+                    f"[QuickSell] SETUP FORBIDDEN in {guild.name}: "
+                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, text={getattr(exc, 'text', str(exc))}"
+                )
+            except discord.HTTPException as exc:
+                print(
+                    f"[QuickSell] SETUP HTTP ERROR in {guild.name}: "
+                    f"status={exc.status}, code={getattr(exc, 'code', 'unknown')}, text={getattr(exc, 'text', str(exc))}"
+                )
+            except Exception as exc:
+                print(f"[QuickSell] SETUP UNEXPECTED ERROR in {guild.name}: {type(exc).__name__}: {exc}")
 
 
 bot = QuickSellBot()
