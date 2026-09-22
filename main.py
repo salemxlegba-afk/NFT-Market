@@ -833,6 +833,73 @@ def match_users(match: sqlite3.Row) -> tuple[int, int]:
 
 
 FINAL_CONFIRMATION_PROMPTS = {}
+NEGOTIATION_CONFIRM_PROMPTS = {}
+
+
+async def post_negotiation_confirm_prompt(channel: discord.TextChannel, match_id: int):
+    old_id = NEGOTIATION_CONFIRM_PROMPTS.pop(match_id, None)
+    if old_id:
+        try:
+            old = await channel.fetch_message(old_id)
+            await old.delete(reason="QuickSell moved CONFIRM panel to bottom")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    msg = await channel.send(
+        "💬 **Négociation en cours**\n\n"
+        "Quand vous avez terminé, cliquez sur **CONFIRM** pour demander la confirmation finale.",
+        view=NegotiationConfirmView(match_id),
+    )
+    NEGOTIATION_CONFIRM_PROMPTS[match_id] = msg.id
+    return msg
+
+
+class NegotiationConfirmView(discord.ui.View):
+    def __init__(self, match_id: int):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+
+    @discord.ui.button(label="CONFIRM", emoji="🔔", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_final_confirmation(interaction, self.match_id)
+
+
+async def open_final_confirmation(interaction: discord.Interaction, match_id: int):
+    match = get_match_for_user(interaction.user.id, match_id)
+    if not match or match["channel_id"] != getattr(interaction.channel, "id", None):
+        await interaction.response.send_message("❌ This deal is not available in this channel.", ephemeral=True)
+        return
+    if match["status"] in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
+        await interaction.response.send_message("❌ This deal is already closed.", ephemeral=True)
+        return
+    con = db()
+    con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match_id))
+    con.commit(); con.close()
+    panel_id = NEGOTIATION_CONFIRM_PROMPTS.pop(match_id, None)
+    if panel_id:
+        try:
+            panel = await interaction.channel.fetch_message(panel_id)
+            await panel.delete(reason="QuickSell opened final confirmation")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    old_final = FINAL_CONFIRMATION_PROMPTS.pop(match_id, None)
+    if old_final:
+        try:
+            old = await interaction.channel.fetch_message(old_final)
+            await old.edit(view=DealConfirmView(match_id, disabled=True))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    await interaction.response.send_message(
+        "🔔 **FINAL CONFIRMATION**\n\n"
+        "Vous avez indiqué que la négociation est terminée.\n\n"
+        "Vérifiez une dernière fois les conditions finales avant de confirmer.\n\n"
+        "**Si vous êtes réellement d'accord avec le prix et les conditions discutés, choisissez votre réponse ci-dessous.**",
+        view=DealConfirmView(match_id),
+    )
+    try:
+        prompt = await interaction.original_response()
+        FINAL_CONFIRMATION_PROMPTS[match_id] = prompt.id
+    except (discord.NotFound, discord.HTTPException):
+        pass
 
 
 async def disable_confirmation_prompt(bot: commands.Bot, match_id: int):
@@ -909,11 +976,7 @@ async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
         ), color=discord.Color.blurple()
     )
     await channel.send(content=f"<@{match['buyer_id']}> <@{match['seller_id']}>", embed=embed)
-    await channel.send(
-        "💬 **NEGOTIATION IN PROGRESS**\n\n"
-        "Talk to each other first. When you are finished, type `/confirm`.\n"
-        "`/confirm` does **not** accept the deal; it only opens the final confirmation buttons at the bottom."
-    )
+    await post_negotiation_confirm_prompt(channel, match["id"])
     return channel
 
 
@@ -984,42 +1047,12 @@ async def confirm_command(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Use `/confirm` inside your private QuickSell Deal Room.", ephemeral=True)
         return
     con = db()
-    match = con.execute(
-        "SELECT m.*, b.user_id buyer_id, b.collection, b.guild_id, s.user_id seller_id "
-        "FROM matches m JOIN requests b ON b.id=m.buy_request_id JOIN requests s ON s.id=m.sell_request_id "
-        "WHERE m.channel_id=?", (interaction.channel.id,)
-    ).fetchone()
+    row = con.execute("SELECT id FROM matches WHERE channel_id=?", (interaction.channel.id,)).fetchone()
     con.close()
-    if not match or interaction.user.id not in {match["buyer_id"], match["seller_id"]}:
-        await interaction.response.send_message("❌ This is not your QuickSell Deal Room.", ephemeral=True)
+    if not row:
+        await interaction.response.send_message("❌ This is not a QuickSell Deal Room.", ephemeral=True)
         return
-    if match["status"] in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
-        await interaction.response.send_message("❌ This deal is already closed.", ephemeral=True)
-        return
-    con = db()
-    con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match["id"]))
-    con.commit()
-    con.close()
-    old = FINAL_CONFIRMATION_PROMPTS.pop(match["id"], None)
-    if old:
-        try:
-            old_message = await interaction.channel.fetch_message(old)
-            await old_message.edit(view=DealConfirmView(match["id"], disabled=True))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-    await interaction.response.send_message(
-        "🔔 **FINAL CONFIRMATION**\n\n"
-        "The negotiation appears to be finished. Review the final price and conditions one last time.\n\n"
-        "⚠️ **Important:** Clicking **I AGREE TO THE DEAL** means you accept the final terms you discussed. "
-        "If you are not ready, do not click it.\n\n"
-        "If negotiation continues after this message, this confirmation will be cancelled and you can use `/confirm` again.",
-        view=DealConfirmView(match["id"]),
-    )
-    try:
-        prompt = await interaction.original_response()
-        FINAL_CONFIRMATION_PROMPTS[match["id"]] = prompt.id
-    except (discord.NotFound, discord.HTTPException):
-        pass
+    await open_final_confirmation(interaction, row["id"])
 
 
 class MainView(discord.ui.View):
@@ -1247,29 +1280,30 @@ class QuickSellBot(commands.Bot):
             return
         con = db()
         match = con.execute(
-            "SELECT id,buyer_confirmed,seller_confirmed,status FROM matches WHERE channel_id=?",
+            "SELECT m.id,m.buyer_confirmed,m.seller_confirmed,m.status,b.user_id buyer_id,s.user_id seller_id "
+            "FROM matches m JOIN requests b ON b.id=m.buy_request_id JOIN requests s ON s.id=m.sell_request_id "
+            "WHERE m.channel_id=?",
             (message.channel.id,),
         ).fetchone()
-        if match and match["status"] not in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
-            if match["buyer_confirmed"] or match["seller_confirmed"]:
-                con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match["id"]))
-                con.commit()
-                prompt_id = FINAL_CONFIRMATION_PROMPTS.pop(match["id"], None)
-                con.close()
-                if prompt_id:
-                    try:
-                        prompt = await message.channel.fetch_message(prompt_id)
-                        await prompt.edit(view=DealConfirmView(match["id"], disabled=True))
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        pass
-                await message.channel.send(
-                    "💬 **NEGOTIATION RESUMED** — the final confirmation was cancelled because a new message was sent.\n"
-                    "When you are finished again, use `/confirm`."
-                )
-            else:
-                con.close()
-        else:
-            con.close()
+        con.close()
+        if not match or message.author.id not in {match["buyer_id"], match["seller_id"]}:
+            return
+        if match["status"] in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
+            return
+        had_final = bool(match["buyer_confirmed"] or match["seller_confirmed"])
+        final_id = FINAL_CONFIRMATION_PROMPTS.pop(match["id"], None)
+        con = db()
+        con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match["id"]))
+        con.commit(); con.close()
+        if final_id:
+            try:
+                prompt = await message.channel.fetch_message(final_id)
+                await prompt.edit(view=DealConfirmView(match["id"], disabled=True))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        if had_final or final_id:
+            await message.channel.send("💬 **Négociation reprise** — la confirmation finale précédente est annulée.\nLe panneau **CONFIRM** a été replacé en bas du salon.")
+        await post_negotiation_confirm_prompt(message.channel, match["id"])
 
     async def on_ready(self):
         print(f"[QuickSell] connected as {self.user} (id={self.user.id})")
