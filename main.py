@@ -34,19 +34,18 @@ MATCH_INTERVAL = 1.0
 QUICKSELL_CATEGORY = "🛒 QUICKSELL"
 QUICKSELL_CHANNEL = "🛒-quicksell"
 PRIVATE_MATCH_CATEGORY = "🔐 PRIVATE MATCHES"
-QUICKSELL_NETWORK = os.getenv("QUICKSELL_NETWORK", "devnet").strip().lower()
-DEVNET_PAYMENT_WALLET = "GuMirVy1WXGL8R1s15N1T7Dj5kANnyNHWGMbsMXHutde"
-MAINNET_PAYMENT_WALLET = "Hj142M1XAPZb8T3SiawuDyxuCt2Z8SXmKSR1CdQKLZWx"
-if QUICKSELL_NETWORK == "devnet":
-    QUICKSELL_RPC_URL = os.getenv("QUICKSELL_RPC_URL", "https://api.devnet.solana.com")
-    QUICKSELL_PAYMENT_WALLET = os.getenv("QUICKSELL_PAYMENT_WALLET", DEVNET_PAYMENT_WALLET)
-    PASS_24H_SOL = os.getenv("QUICKSELL_24H_SOL", "0.01")
-    PASS_48H_SOL = os.getenv("QUICKSELL_48H_SOL", "0.01")
-else:
-    QUICKSELL_RPC_URL = os.getenv("QUICKSELL_RPC_URL", "https://api.mainnet-beta.solana.com")
-    QUICKSELL_PAYMENT_WALLET = os.getenv("QUICKSELL_PAYMENT_WALLET", MAINNET_PAYMENT_WALLET)
-    PASS_24H_SOL = os.getenv("QUICKSELL_24H_SOL")
-    PASS_48H_SOL = os.getenv("QUICKSELL_48H_SOL")
+# QuickSell is MAINNET-ONLY.
+QUICKSELL_NETWORK = "mainnet-beta"
+QUICKSELL_RPC_URL = os.getenv("QUICKSELL_RPC_URL", "https://api.mainnet-beta.solana.com")
+QUICKSELL_PAYMENT_WALLET = os.getenv(
+    "QUICKSELL_PAYMENT_WALLET",
+    "4d6ysJay9pUvn6ti6wMShzMCzPkkKCQVXnkNpbHmUdaF",
+)
+PASS_24H_USD = 8.0
+PASS_48H_USD = 15.0
+SOL_PRICE_URL = os.getenv("QUICKSELL_SOL_PRICE_URL", "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd")
+SOL_PRICE_CACHE_SECONDS = 60
+_sol_price_cache = {"price": None, "at": 0.0}
 PAYMENT_POLL_SECONDS = 5
 PAYMENT_MAX_AGE_SECONDS = 60 * 60 * 6
 DEAL_CHANNEL_TTL_HOURS = 48
@@ -139,8 +138,12 @@ def init_db() -> None:
     add_column_if_missing(con, "matches", "closed_at", "REAL")
     add_column_if_missing(con, "matches", "buyer_ready", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(con, "matches", "seller_ready", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(con, "matches", "negotiation_prompt_id", "INTEGER")
+    add_column_if_missing(con, "matches", "final_prompt_id", "INTEGER")
     add_column_if_missing(con, "access_passes", "match_id", "INTEGER")
     add_column_if_missing(con, "access_passes", "expected_sol", "REAL")
+    add_column_if_missing(con, "access_passes", "price_usd", "REAL")
+    add_column_if_missing(con, "access_passes", "sol_usd_rate", "REAL")
     add_column_if_missing(con, "access_passes", "created_at", "REAL")
     con.execute("UPDATE access_passes SET created_at=? WHERE created_at IS NULL", (now(),))
     con.commit()
@@ -173,15 +176,52 @@ def format_sol(value: float) -> str:
     return f"{value:g} SOL"
 
 
-def plan_price(hours: int) -> Optional[float]:
-    raw = PASS_24H_SOL if hours == 24 else PASS_48H_SOL if hours == 48 else None
-    if raw is None:
-        return None
+def plan_price_usd(hours: int) -> Optional[float]:
+    if hours == 24:
+        return PASS_24H_USD
+    if hours == 48:
+        return PASS_48H_USD
+    return None
+
+
+async def get_sol_usd_price() -> Optional[float]:
+    now_ts = time.time()
+    cached = _sol_price_cache.get("price")
+    cached_at = float(_sol_price_cache.get("at") or 0)
+    if cached and now_ts - cached_at < SOL_PRICE_CACHE_SECONDS:
+        return float(cached)
+
+    request = urllib.request.Request(
+        SOL_PRICE_URL,
+        headers={"Accept": "application/json", "User-Agent": "QuickSell/1.0"},
+        method="GET",
+    )
     try:
-        value = float(raw)
-        return value if value > 0 else None
-    except ValueError:
+        loop = asyncio.get_running_loop()
+        def do_request():
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode())
+        data = await loop.run_in_executor(None, do_request)
+        price = float(((data.get("solana") or {}).get("usd")))
+        if price <= 0:
+            return None
+        _sol_price_cache.update({"price": price, "at": now_ts})
+        return price
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
+
+
+async def plan_price(hours: int) -> Optional[tuple[float, float]]:
+    usd = plan_price_usd(hours)
+    if usd is None:
+        return None
+    sol_usd = await get_sol_usd_price()
+    if sol_usd is None:
+        return None
+    # Round to 9 decimals (1 lamport precision) so the displayed amount is
+    # directly payable on Solana and the verifier can require at least that amount.
+    expected_sol = round(usd / sol_usd, 9)
+    return expected_sol, sol_usd
 
 
 async def solana_rpc(method: str, params: list) -> Optional[dict]:
@@ -202,7 +242,7 @@ async def solana_rpc(method: str, params: list) -> Optional[dict]:
         return None
 
 
-async def verify_solana_payment(signature: str, expected_sol: float) -> tuple[str, Optional[float]]:
+async def verify_solana_payment(signature: str, expected_sol: float, not_before: Optional[float] = None) -> tuple[str, Optional[float]]:
     """Verify a real native-SOL System Program transfer to the configured wallet.
 
     Returns CONFIRMED, PENDING or INVALID. PENDING means RPC/indexing uncertainty;
@@ -243,6 +283,14 @@ async def verify_solana_payment(signature: str, expected_sol: float) -> tuple[st
 
     meta = tx.get("meta") or {}
     if meta.get("err") is not None:
+        return "INVALID", None
+
+    # A payment must not be an old, unrelated transaction that happened before
+    # the access pass was created. Allow a small clock-skew tolerance.
+    block_time = tx.get("blockTime")
+    if block_time is None:
+        return "PENDING", None
+    if not_before is not None and block_time < float(not_before) - 120:
         return "INVALID", None
 
     system_program = "11111111111111111111111111111111"
@@ -555,10 +603,8 @@ def has_active_pass(user_id: int, match_id: int) -> bool:
 
 
 def access_embed(match: sqlite3.Row) -> discord.Embed:
-    p24 = plan_price(24)
-    p48 = plan_price(48)
-    price24 = format_sol(p24) if p24 is not None else "not configured"
-    price48 = format_sol(p48) if p48 is not None else "not configured"
+    price24 = f"${PASS_24H_USD:.2f} USD"
+    price48 = f"${PASS_48H_USD:.2f} USD"
     return discord.Embed(
         title="🔒 Contact Locked",
         description=(
@@ -590,24 +636,29 @@ class AccessPlanView(discord.ui.View):
 
 
 async def start_payment(interaction: discord.Interaction, match_id: int, hours: int):
-    amount = plan_price(hours)
-    if amount is None:
+    pricing = await plan_price(hours)
+    if pricing is None:
         await interaction.response.send_message(
-            "⚠️ This access price is not configured yet. The bot will not ask you to send money until the price is configured.",
+            "⚠️ Unable to retrieve the current SOL/USD price right now. No payment should be sent until pricing is available.",
             ephemeral=True,
         )
         return
+    amount, sol_usd_rate = pricing
+    usd_amount = plan_price_usd(hours)
     match = get_match_for_user(interaction.user.id, match_id)
     if not match:
         await interaction.response.send_message("❌ This match is not available to you.", ephemeral=True)
+        return
+    if match["status"] not in {DealStatus.CONTACT_UNLOCKED.value, DealStatus.WAITING_CONFIRMATION.value}:
+        await interaction.response.send_message("❌ This match is no longer accepting a new access payment.", ephemeral=True)
         return
     if not (match["buyer_ready"] and match["seller_ready"]):
         await interaction.response.send_message("⏳ Both parties must agree to proceed before payment is requested.", ephemeral=True)
         return
     con = db()
     cur = con.execute(
-        "INSERT INTO access_passes (user_id,match_id,plan_hours,expected_sol,status,created_at) VALUES (?,?,?,?,?,?)",
-        (interaction.user.id, match_id, hours, amount, PaymentStatus.WAITING.value, now()),
+        "INSERT INTO access_passes (user_id,match_id,plan_hours,expected_sol,price_usd,sol_usd_rate,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (interaction.user.id, match_id, hours, amount, usd_amount, sol_usd_rate, PaymentStatus.WAITING.value, now()),
     )
     pass_id = cur.lastrowid
     con.commit()
@@ -616,7 +667,9 @@ async def start_payment(interaction: discord.Interaction, match_id: int, hours: 
         embed=discord.Embed(
             title=f"💳 {hours}H QuickSell Access",
             description=(
-                f"Amount to send: **{format_sol(amount)}**\n\n"
+                f"Price: **${usd_amount:.2f} USD**\n"
+                f"Amount to send: **{format_sol(amount)}**\n"
+                f"SOL/USD rate used: **${sol_usd_rate:.2f} per SOL**\n\n"
                 f"Solana wallet:\n`{QUICKSELL_PAYMENT_WALLET}`\n\n"
                 "1. Send the exact amount on Solana.\n"
                 "2. Copy the transaction signature.\n"
@@ -707,7 +760,7 @@ async def verify_and_apply_payment(interaction: discord.Interaction, pass_id: in
         return "INVALID"
     con.close()
 
-    state, observed = await verify_solana_payment(signature, row["expected_sol"])
+    state, observed = await verify_solana_payment(signature, row["expected_sol"], row["created_at"])
     if state != "CONFIRMED":
         if state == "INVALID":
             con = db(); con.execute("UPDATE access_passes SET status=? WHERE id=?", (PaymentStatus.FAILED.value, pass_id)); con.commit(); con.close()
@@ -844,12 +897,17 @@ async def post_negotiation_confirm_prompt(channel: discord.TextChannel, match_id
             await old.delete(reason="QuickSell moved CONFIRM panel to bottom")
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+
     msg = await channel.send(
         "💬 **Négociation en cours**\n\n"
         "Quand vous avez terminé, cliquez sur **CONFIRM** pour demander la confirmation finale.",
         view=NegotiationConfirmView(match_id),
     )
     NEGOTIATION_CONFIRM_PROMPTS[match_id] = msg.id
+    con = db()
+    con.execute("UPDATE matches SET negotiation_prompt_id=? WHERE id=?", (msg.id, match_id))
+    con.commit()
+    con.close()
     return msg
 
 
@@ -857,9 +915,16 @@ class NegotiationConfirmView(discord.ui.View):
     def __init__(self, match_id: int):
         super().__init__(timeout=None)
         self.match_id = match_id
+        button = discord.ui.Button(
+            label="CONFIRM",
+            emoji="🔔",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"quicksell:negconfirm:{match_id}",
+        )
+        button.callback = self.confirm_callback
+        self.add_item(button)
 
-    @discord.ui.button(label="CONFIRM", emoji="🔔", style=discord.ButtonStyle.primary)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def confirm_callback(self, interaction: discord.Interaction):
         await open_final_confirmation(interaction, self.match_id)
 
 
@@ -871,23 +936,33 @@ async def open_final_confirmation(interaction: discord.Interaction, match_id: in
     if match["status"] in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
         await interaction.response.send_message("❌ This deal is already closed.", ephemeral=True)
         return
+
     con = db()
-    con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match_id))
-    con.commit(); con.close()
-    panel_id = NEGOTIATION_CONFIRM_PROMPTS.pop(match_id, None)
+    con.execute(
+        "UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=?,negotiation_prompt_id=NULL,final_prompt_id=NULL WHERE id=?",
+        (DealStatus.WAITING_CONFIRMATION.value, match_id),
+    )
+    con.commit()
+    con.close()
+
+    panel_id = NEGOTIATION_CONFIRM_PROMPTS.pop(match_id, None) or match["negotiation_prompt_id"]
     if panel_id:
         try:
             panel = await interaction.channel.fetch_message(panel_id)
-            await panel.delete(reason="QuickSell opened final confirmation")
+            await panel.edit(view=NegotiationConfirmView(match_id))
+            # Disable by replacing the panel with a harmless inactive view.
+            await panel.edit(view=DisabledView())
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
-    old_final = FINAL_CONFIRMATION_PROMPTS.pop(match_id, None)
+
+    old_final = FINAL_CONFIRMATION_PROMPTS.pop(match_id, None) or match["final_prompt_id"]
     if old_final:
         try:
             old = await interaction.channel.fetch_message(old_final)
-            await old.edit(view=DealConfirmView(match_id, disabled=True))
+            await old.edit(view=DisabledView())
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+
     await interaction.response.send_message(
         "🔔 **FINAL CONFIRMATION**\n\n"
         "Vous avez indiqué que la négociation est terminée.\n\n"
@@ -898,8 +973,19 @@ async def open_final_confirmation(interaction: discord.Interaction, match_id: in
     try:
         prompt = await interaction.original_response()
         FINAL_CONFIRMATION_PROMPTS[match_id] = prompt.id
+        con = db()
+        con.execute("UPDATE matches SET final_prompt_id=? WHERE id=?", (prompt.id, match_id))
+        con.commit()
+        con.close()
     except (discord.NotFound, discord.HTTPException):
         pass
+
+
+class DisabledView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+
 
 
 async def disable_confirmation_prompt(bot: commands.Bot, match_id: int):
@@ -941,6 +1027,11 @@ async def close_deal_channel(channel: Optional[discord.TextChannel], delay: int 
 async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
     existing = guild.get_channel(match["channel_id"]) if match["channel_id"] else None
     if isinstance(existing, discord.TextChannel):
+        if match["status"] not in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
+            try:
+                await post_negotiation_confirm_prompt(existing, match["id"])
+            except (discord.Forbidden, discord.HTTPException):
+                pass
         return existing
     category = discord.utils.get(guild.categories, name=PRIVATE_MATCH_CATEGORY)
     if category is None:
@@ -982,22 +1073,31 @@ async def ensure_deal_channel(guild: discord.Guild, match: sqlite3.Row):
 
 class DealConfirmView(discord.ui.View):
     def __init__(self, match_id: int, disabled: bool = False):
-        super().__init__(timeout=15 * 60)
+        super().__init__(timeout=None)
         self.match_id = match_id
-        self.disabled_state = disabled
-
-    @discord.ui.button(label="I AGREE TO THE DEAL", emoji="🤝", style=discord.ButtonStyle.success)
-    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.disabled_state:
-            await interaction.response.send_message("⚠️ This confirmation is no longer valid. If negotiation continues, use `/confirm` again.", ephemeral=True)
+        if disabled:
             return
+        agree = discord.ui.Button(
+            label="I AGREE TO THE DEAL",
+            emoji="🤝",
+            style=discord.ButtonStyle.success,
+            custom_id=f"quicksell:dealagree:{match_id}",
+        )
+        decline = discord.ui.Button(
+            label="I DON'T AGREE",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"quicksell:dealdecline:{match_id}",
+        )
+        agree.callback = self.agree_callback
+        decline.callback = self.decline_callback
+        self.add_item(agree)
+        self.add_item(decline)
+
+    async def agree_callback(self, interaction: discord.Interaction):
         await confirm_deal(interaction, self.match_id, True)
 
-    @discord.ui.button(label="I DON'T AGREE", emoji="❌", style=discord.ButtonStyle.danger)
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.disabled_state:
-            await interaction.response.send_message("⚠️ This confirmation is no longer valid. If negotiation continues, use `/confirm` again.", ephemeral=True)
-            return
+    async def decline_callback(self, interaction: discord.Interaction):
         await confirm_deal(interaction, self.match_id, False)
 
 
@@ -1152,6 +1252,15 @@ class QuickSellBot(commands.Bot):
     async def setup_hook(self):
         init_db()
         self.add_view(MainView())
+        con = db()
+        open_matches = con.execute(
+            "SELECT id,status FROM matches WHERE status NOT IN (?,?,?) AND channel_id IS NOT NULL",
+            (DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value),
+        ).fetchall()
+        con.close()
+        for row in open_matches:
+            self.add_view(NegotiationConfirmView(row["id"]))
+            self.add_view(DealConfirmView(row["id"]))
         self.match_task = asyncio.create_task(matching_loop(self))
         try:
             await self.tree.sync()
@@ -1161,7 +1270,25 @@ class QuickSellBot(commands.Bot):
     async def ensure_public_quicksell(self, guild: discord.Guild):
         me = guild.me
         if me is None:
+            print(f"[QuickSell] ERROR: guild.me unavailable in {guild.name}")
             return None
+        gp = me.guild_permissions
+        print(
+            "[QuickSell] BOT GUILD PERMISSIONS: "
+            + ", ".join(
+                f"{name}={'OK' if value else 'MISSING'}"
+                for name, value in {
+                    "View Channel": gp.view_channel,
+                    "Send Messages": gp.send_messages,
+                    "Embed Links": gp.embed_links,
+                    "Read Message History": gp.read_message_history,
+                    "Manage Channels": gp.manage_channels,
+                    "Manage Permissions": gp.manage_permissions,
+                    "Manage Messages": gp.manage_messages,
+                    "Create Invite": gp.create_instant_invite,
+                }.items()
+            )
+        )
         category = discord.utils.get(guild.categories, name=QUICKSELL_CATEGORY)
         if category is None:
             category = await guild.create_category(QUICKSELL_CATEGORY, reason="QuickSell public marketplace")
@@ -1280,7 +1407,7 @@ class QuickSellBot(commands.Bot):
             return
         con = db()
         match = con.execute(
-            "SELECT m.id,m.buyer_confirmed,m.seller_confirmed,m.status,b.user_id buyer_id,s.user_id seller_id "
+            "SELECT m.id,m.buyer_confirmed,m.seller_confirmed,m.status,m.final_prompt_id,b.user_id buyer_id,s.user_id seller_id "
             "FROM matches m JOIN requests b ON b.id=m.buy_request_id JOIN requests s ON s.id=m.sell_request_id "
             "WHERE m.channel_id=?",
             (message.channel.id,),
@@ -1291,9 +1418,12 @@ class QuickSellBot(commands.Bot):
         if match["status"] in {DealStatus.DEAL_CONFIRMED.value, DealStatus.DECLINED.value, DealStatus.CLOSED.value}:
             return
         had_final = bool(match["buyer_confirmed"] or match["seller_confirmed"])
-        final_id = FINAL_CONFIRMATION_PROMPTS.pop(match["id"], None)
+        final_id = FINAL_CONFIRMATION_PROMPTS.pop(match["id"], None) or match["final_prompt_id"]
         con = db()
-        con.execute("UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=? WHERE id=?", (DealStatus.WAITING_CONFIRMATION.value, match["id"]))
+        con.execute(
+            "UPDATE matches SET buyer_confirmed=0,seller_confirmed=0,status=?,final_prompt_id=NULL WHERE id=?",
+            (DealStatus.WAITING_CONFIRMATION.value, match["id"]),
+        )
         con.commit(); con.close()
         if final_id:
             try:
@@ -1311,7 +1441,7 @@ class QuickSellBot(commands.Bot):
         print(f"[QuickSell] payment network={QUICKSELL_NETWORK}")
         print(f"[QuickSell] payment RPC={QUICKSELL_RPC_URL}")
         print(f"[QuickSell] payment wallet={QUICKSELL_PAYMENT_WALLET}")
-        print(f"[QuickSell] test prices: 24H={PASS_24H_SOL}, 48H={PASS_48H_SOL}")
+        print("[QuickSell] access prices: 24H=$8.00 USD, 48H=$15.00 USD (converted to SOL at payment time)")
         for guild in self.guilds:
             try:
                 channel = await self.ensure_public_quicksell(guild)
